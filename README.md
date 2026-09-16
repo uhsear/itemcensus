@@ -277,3 +277,5 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [sharewatch](https://github.com/uhsear/sharewatch) - once you can enumerate the org, diff its sharing posture against yesterday
 - [sightline](https://github.com/uhsear/sightline) - what a viewer can actually see among the items you just counted
+- [whobreaks](https://github.com/uhsear/whobreaks) - what references an item before you delete it
+- [ghostsvc](https://github.com/uhsear/ghostsvc) - services the portal does not know it publishes
