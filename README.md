@@ -270,3 +270,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [sharewatch](https://github.com/uhsear/sharewatch) - once you can enumerate the org, diff its sharing posture against yesterday
+- [sightline](https://github.com/uhsear/sightline) - what a viewer can actually see among the items you just counted
