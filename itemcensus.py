@@ -2005,6 +2005,8 @@ def self_test():
           "--max-partitions defaults to the configured budget")
     check(_parse(["--self-test"]).self_test is True, "--self-test parses")
     check(_parse(["--url", PORTAL, "--apply"]).apply is True, "--apply is read")
+    refuses(["--url", PORTAL, "--ap"],
+            "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
     check(_parse(["--url", PORTAL, "--insecure"]).insecure is True,
           "--insecure is read")
     check(_parse(["--url", PORTAL, "--token", "T"]).token == "T",
@@ -2091,6 +2093,7 @@ def _parse(argv):
         epilog="Read-only. No flag changes anything in the organization. The "
                "password is never a flag: export %s or answer the prompt."
                % SECRET_ENV,
+        allow_abbrev=False,
     )
     ap.add_argument("--url",
                     help="portal url, e.g. https://county.maps.arcgis.com")

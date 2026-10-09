@@ -62,11 +62,12 @@ PASS  no credential reaches the inventory file on disk  <-- pinned defect
 PASS  the csv has no blank line between rows, which is what newline='' prevents on windows  <-- pinned defect
 PASS  a census that cannot be completed exits 2, and does not print a total  <-- pinned defect
 PASS  the command line counts an org past the ceiling  <-- pinned defect
+PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
 PASS  there is no --password attribute at all, because argv is readable by every process on the box  <-- pinned defect
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, a census that did not refuse, a census that raised the wrong thing, a portal call that did not fail and one that refused instead as nine failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-316 assertions, 0 failed
+317 assertions, 0 failed
 ```
 
 ## Requirements
