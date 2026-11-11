@@ -408,8 +408,19 @@ def crawl_partition(fetch, query, num=SEARCH_MAX_NUM):
             raise ValueError("fetch returned a %s, which is not a search "
                              "response" % type(page).__name__)
         pages += 1
-        totals.append(int(page.get("total") or 0))
-        results = page.get("results") or []
+        total = page.get("total")
+        results = page.get("results")
+        if (not isinstance(total, int) or isinstance(total, bool)
+                or not isinstance(results, list)):
+            # An empty object, a maintenance notice and a login page all parse
+            # as JSON. Read as a total of 0 they used to reconcile, and the
+            # census exited 0 having counted nothing. Keys only, as below.
+            raise ValueError("the portal's search answer is not a search "
+                             "response: it needs an integer total and a "
+                             "results list (it has the keys: %s)"
+                             % (", ".join(sorted("%s" % key for key in page))
+                                or "none"))
+        totals.append(total)
         for raw in results:
             iid = raw.get("id")
             if not iid:
@@ -557,8 +568,9 @@ def build_inventory(url, query, taken, result):
         "warnings": list(result.warnings),
         "partitions": [{"query": q, "reported": t, "returned": n}
                        for q, t, n in result.partitions],
-        # Sorted so that two censuses of an unchanged org produce the same
-        # bytes, which is what makes diffing two inventory files useful.
+        # Sorted by id, so the items of two censuses of an unchanged org are in
+        # the same order. The JSON still differs by "taken" and by the clock
+        # reading inside the partition queries. Only the CSV is byte-stable.
         "items": [item_record(raw)
                   for _iid, raw in sorted(result.items.items())],
     }
@@ -748,11 +760,13 @@ def org_id(url, token, insecure=False):
 
 
 def org_owners(url, token, insecure=False):
-    """Every username in the org, for the owner bisect. Empty when unreadable.
+    """Every username in the org, for the owner bisect. Empty with no token.
 
     Only ever used to make a bisect finer, never to decide what the census
     covers, so an incomplete list costs partitions and not items. That is the
-    whole reason each owner split is paired with its own complement.
+    whole reason each owner split is paired with its own complement. A portal
+    that refuses the list raises RuntimeError here, and main() carries on
+    without it.
     """
     if not token:
         return ()
@@ -799,8 +813,8 @@ def cell(value):
     """A CSV cell that a spreadsheet will not run as a formula.
 
     A title, owner or id comes from the portal, and anyone who can name an item
-    can name it =HYPERLINK(...). The inventory is opened in Excel by the person
-    asking how many items there are. Text that starts with = + - @ tab or CR gets
+    can name it =HYPERLINK(...). An inventory is the kind of file somebody opens
+    in a spreadsheet, though nothing here opened one. Text that starts with = + - @ tab or CR gets
     one apostrophe in front. Numbers pass through untouched: size is -1 for an
     unknown size, and that is a number, not a formula. Whoever reads this file
     back strips exactly one leading apostrophe from a cell whose next character
@@ -1298,6 +1312,28 @@ def self_test(_nested=False):
     raises(lambda: crawl_partition(
         lambda q, s, n: {"total": 1, "results": [{"title": "no id"}]}, "q"),
         "a search result with no id raises rather than being keyed under None")
+
+    for what, junk in (
+            ("an empty object", {}),
+            ("an object with a results list and no total", {"results": []}),
+            ("a maintenance notice", {"message": "maintenance"}),
+            ("a total that is text", {"total": "5", "results": []}),
+            ("a total that is True", {"total": True, "results": []}),
+            ("results that are not a list", {"total": 0, "results": None})):
+        raises(lambda junk=junk: crawl_partition(lambda q, s, n: junk, "q"),
+               "%s is not a search response and is refused, never read as "
+               "zero items  <-- pinned defect" % what)
+    try:
+        crawl_partition(lambda q, s, n: {}, "q")
+    except ValueError as exc:
+        check("not a search response" in "%s" % exc and "none" in "%s" % exc,
+              "and the refusal says so, and that the object had no keys")
+    try:
+        crawl_partition(lambda q, s, n: {"message": "m", "token": "SECRET"},
+                        "q")
+    except ValueError as exc:
+        check("message, token" in "%s" % exc and "SECRET" not in "%s" % exc,
+              "and lists the keys it did have and never a value")
 
     overlapping = [
         {"total": 3, "nextStart": -1,
@@ -1945,6 +1981,50 @@ def self_test(_nested=False):
         check("SVCTOKEN" not in seen and "title" in seen,
               "without quoting the row, whose service url can carry a token  "
               "<-- pinned defect")
+
+        code, seen = captured(lambda: serving(
+            FakePortal(lambda q, s, n: {}),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--query", "orgid:X"])))
+        check(code == 2 and "not a search response" in seen
+              and "Every partition reconciled" not in seen,
+              "an answer that is not a search response exits 2 and does not "
+              "claim an empty org reconciled  <-- pinned defect")
+
+        class NoUserList(FakePortal):
+            def _body(self, path, params):
+                if path.endswith("/portals/self/users"):
+                    return {"error": {"code": 403, "message": "no access"}}
+                return FakePortal._body(self, path, params)
+
+        code, seen = captured(lambda: serving(
+            NoUserList(Catalog(rows(250))),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--query", "orgid:X"])))
+        check(code == 0 and "250 item(s)" in seen
+              and "the user list could not be read" in seen
+              and "403 no access" in seen and "TESTTOKEN" not in seen,
+              "a portal that refuses the user list is counted anyway, with a "
+              "note and no owner bisect  <-- pinned defect")
+
+        ambient_env = os.environ.copy()
+        os.environ.pop(SECRET_ENV, None)
+        real_getpass = getpass.getpass
+
+        def no_console(prompt):
+            raise EOFError()
+
+        getpass.getpass = no_console
+        try:
+            code, seen = captured(lambda: main(
+                ["--url", PORTAL, "--username", "gis_admin"]))
+        finally:
+            getpass.getpass = real_getpass
+            os.environ.clear()
+            os.environ.update(ambient_env)
+        check(code == 2 and SECRET_ENV in seen and "Traceback" not in seen,
+              "a run with no password and no console exits 2 and names %s, "
+              "not a traceback and exit 1  <-- pinned defect" % SECRET_ENV)
 
         code, seen = captured(lambda: serving(
             FakePortal(Catalog(rows(250)), users=["ann"]),
@@ -2595,13 +2675,27 @@ def main(argv=None):
         # The user list only ever makes a bisect finer. An org that will not
         # hand it over costs partitions, never items, because the other half of
         # every owner split is "not these owners".
-        owners = org_owners(args.url, token, args.insecure)
+        try:
+            owners = org_owners(args.url, token, args.insecure)
+        except RuntimeError as exc:
+            owners = ()
+            print("note: the user list could not be read (%s), so the owner "
+                  "bisect is off. Every item is still counted, and a day "
+                  "that sits on the ceiling is refused instead of split."
+                  % exc, file=sys.stderr)
         if owners:
             print("%d owner(s) available for the owner bisect" % len(owners))
         result = census(portal_fetch(args.url, token, args.insecure),
                         base=query, owners=owners, now_ms=None, num=args.num,
                         max_partitions=args.max_partitions,
                         echo=lambda line: print(line))
+    except EOFError:
+        # getpass found no console to ask on. A scheduled job gets here. It
+        # was a traceback and exit 1, which means "did not reconcile".
+        print("error: no password was given and there is no console to ask "
+              "on. Export %s before an unattended run." % SECRET_ENV,
+              file=sys.stderr)
+        return 2
     except CensusIncomplete as exc:
         print("")
         print("error: the census could not be completed, so no total is given.",

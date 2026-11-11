@@ -8,14 +8,14 @@ anybody asks is how many items are in it. So you run a census. It says 10,000.
 
 Esri's REST reference says it plainly about `/sharing/rest/search`. The `total` "is counted
 accurately up to 10,000; if the total number is greater than this value, 10,000 will be
-returned", and `num` has a "maximum allowed value" of 100. Every inventory, backup and cleanup script in the wild inherits that ceiling and reports
+returned", and `num` has a "maximum allowed value" of 100. A script that pages `search` and trusts the total inherits that ceiling and reports
 success at it. Your census is wrong by an unknown amount, and the thing that makes it dangerous
 is that a true total of 10,000 and a truncated one are identical on the screen. Nothing is
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 417 lines. Here are the first fourteen and the last nine, copied
-unchanged from one run, with nothing elided inside either excerpt.
+A real run prints 432 lines, 428 of them assertions. Here are the first fourteen and the last
+nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
 $ python itemcensus.py --self-test
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-417 assertions, 0 failed
+428 assertions, 0 failed
 ```
 
 ## Requirements
@@ -306,16 +306,18 @@ and the file it wrote:
 }
 ```
 
-`--format csv` writes those nine columns and nothing else. Items are sorted by id in both, so two
-censuses of an unchanged organization produce the same bytes and `diff` is useful.
+`--format csv` writes those nine columns and nothing else. Items are sorted by id in both. The
+CSV of two censuses of an unchanged organization is the same bytes, so `diff` is useful on it.
+The JSON is not: it carries `taken` and the clock reading inside each partition query, so two
+JSON files differ on those lines even when the items match.
 
 ### CSV and spreadsheet formulas
 
 A title, an owner and an id come from the portal, and anyone who can name an item chooses what
-lands in the file. The inventory is opened in Excel by the person who asked how many items
-there are. So in `--format csv`, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a
-carriage return gets one apostrophe in front of it. OWASP's CSV Injection page lists those
-leading characters and recommends the single quote prefix. Every text column is guarded: `id`,
+lands in the file. An inventory is the kind of file somebody opens in a spreadsheet. So in
+`--format csv`, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets
+one apostrophe in front of it. OWASP's CSV Injection page lists those leading characters and
+lists the single quote prefix as one of several mitigations. Every text column is guarded: `id`,
 `title`, `owner`, `type` and `access`. The four number columns (`created`, `modified`, `size`,
 `numViews`) are never touched, so the `-1` the portal sends for an unknown size stays the number
 `-1`. JSON is not a spreadsheet format and is written as the portal sent it.
@@ -350,8 +352,8 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 - No group membership. An item's groups need a call per group, which is `sharewatch`'s shape,
   not this one's.
 - It cannot see items it is not allowed to see. An anonymous census counts public items, and a
-  census run as a non-administrator counts what that user can search. The number is honest about
-  the query, not about the organization.
+  census run as a non-administrator is limited to what that user can search. This was not run
+  against a real portal. The number is honest about the query, not about the organization.
 - More than 10,000 items created by one user, of one type, in one day cannot be counted by this
   method, because the search API offers nothing narrower to split on. That is the case it
   refuses, and the refusal names the exact query it gave up on.
@@ -368,16 +370,47 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   and turns it into `=x`. A self-test assertion marked "known limit" pins that.
 - Nothing here opened Excel or any other spreadsheet. The assertions check the bytes in the file.
   OWASP warns the quote prefix is unreliable after Excel saves and reopens a CSV, so treat the
-  file as an inventory to read, and as input to a script, not as a workbook to resave.
+  file as an inventory to read, and as input to a script, not as a workbook to resave. The
+  OWASP page lists the quote prefix as one option among several and does not call any of them
+  reliable once Excel has resaved the file.
+- The CSV is written as UTF-8 without a byte order mark. Excel opened by double-click may show a
+  non-ASCII title garbled. Import the file as UTF-8 instead.
 - The tail partition ends at 9999-12-31 (`253402300799999` ms). That value is accepted by the
   stub portals used here. It was not run against a real ArcGIS portal, so if a portal rejects
   it the census exits 2 with the portal's message rather than returning a total.
 - The numeric fields (`created`, `modified`, `size`, `numViews`) are assumed to be numbers. A
   portal that sends text there, for example `"created": "abc"`, stops a run that has `--out`
   with a Python traceback and exit 1, which this README does not define as "did not reconcile".
+  The check-only run stops too, because the inventory is built before `--apply` is looked at.
+  Other wrong JSON shapes inside an otherwise valid object, such as a users row that is not an
+  object or a `total` of `1e999`, end the same way.
+- A search answer with no integer `total` or no `results` list, such as `{}` or a maintenance
+  notice, aborts the census with exit 2 and the keys it had. It is never read as an empty
+  organization.
 - A search result with no `id` aborts the census with exit 2 and a message that lists the
   fields the row had, not the row. A `fetch` that returns something other than a search
   response is reported by type only.
+- The census reads `portals/self/users` whenever a token is present, even when no owner split
+  turns out to be needed. That is one more request. If the portal refuses the list, the census
+  prints a note and runs without the owner split, so a day that sits on the ceiling is refused
+  instead of split. The list is not de-duplicated and is paged until `nextStart` ends or passes
+  10,000, so a portal that ignores `start` there makes the owner list very long.
+- An item created but not yet indexed by the portal's search is in neither the reported total
+  nor the rows. Exit 0 means the search index agreed with itself, not that every item was
+  indexed.
+- The leading-minus form (`-owner:(...)`, `-type:(...)`) that every complement split relies on
+  ran only against a synthetic query evaluator. Esri's search reference page shows `-` as an
+  infix operator and the leading form was not run against a real portal. The same holds for
+  `sortField=created` and the end-of-results `nextStart` of `-1`.
+- A write failure after a census that did not reconcile exits 73, not 1. Read the printed
+  warnings, not only the exit code.
+- With `--username` and no `ITEMCENSUS_PASSWORD` the tool prompts and waits for a console, and
+  on Windows it waits even with stdin redirected. An unattended job must export the variable.
+  With no console at all the run exits 2 and names the variable.
+- The tool uses the proxy named in the environment and follows HTTP redirects. A token in a
+  search url is visible to that proxy. It is not re-sent to a redirect target by the tool.
+- An `--out` path the console cannot encode writes the file and then ends with a Python
+  traceback. Set `PYTHONIOENCODING=utf-8`.
 - A token travels in the query string of each search request, which is where Esri's search
   endpoint expects it. Anything that logs request urls on the portal or on a proxy will see it.
 - `--url http://...` together with `--username` posts the password over cleartext HTTP. Only
@@ -407,16 +440,16 @@ Measured on 2026-11-11, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13 | 417, 0 failed |
-| Windows | 3.12 | 417, 0 failed |
-| Windows | 3.10.20 | 417, 0 failed |
-| Windows | 3.9.25 | 417, 0 failed |
-| Windows, ArcGIS Pro `arcgispro-py3` clone | 3.13.7 | 417, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 417, 0 failed |
+| Windows | 3.13.2 | 428, 0 failed |
+| Windows | 3.12.10 | 428, 0 failed |
+| Windows | 3.10.20 | 428, 0 failed |
+| Windows | 3.9.25 | 428, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 428, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 428, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1256 statements, 208 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1297 statements, 214 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
@@ -435,7 +468,7 @@ summary goes red, and by running the file with `runpy` once as a script and once
   `created: [start TO end]` in epoch milliseconds with inclusive brackets, `orgid:`, `owner:`,
   and the `-` prohibit operator that every complement split relies on.
 - OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the leading
-  characters and the single quote prefix.
+  characters, and the single quote prefix as one of several mitigations.
 - Python, [csv](https://docs.python.org/3/library/csv.html): open the file with `newline=''`,
   and the writer's default line terminator is `\r\n`.
 
