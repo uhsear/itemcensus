@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Inventory every item in an ArcGIS organization, and refuse to report a total the server cannot prove is complete.
 
-Esri's REST reference says it plainly about /sharing/rest/search: the count is
-accurate only to 10,000, beyond that the server returns 10,000, and num is
-capped at 100 whatever you ask for. Every inventory, backup and cleanup script
+Esri's REST reference says it plainly about /sharing/rest/search: the total "is
+counted accurately up to 10,000; if the total number is greater than this value,
+10,000 will be returned", and num has a maximum of 100. Every inventory, backup and cleanup script
 in the wild inherits that ceiling and reports success at it. You run a census
 before a migration, it says 10,000 items, and it is wrong by an unknown amount.
 At the cap a true total and a truncated one are identical, which is why nobody
@@ -11,13 +11,10 @@ notices.
 
 The ArcGIS API for Python is the obvious tool and it is good at what it does.
 gis.content.search takes a max_items, advanced_search pages for you, and both
-are far less code than this. Neither one can tell you whether what came back was
-everything: advanced_search hands back the same capped total the REST endpoint
-gave it, and max_items=-1 stops at the ceiling without saying so. The gap is not
-paging, it is proof. This tool pages the same way and then refuses to print a
-number it cannot reconcile against the server's own count, and when a slice of
-the org sits on the cap it bisects that slice until every piece is provably
-under it.
+are far less code than this. The gap is not paging, it is proof. This tool pages
+the same way and then refuses to print a number it cannot reconcile against the
+server's own count, and when a slice of the org sits on the cap it bisects that
+slice until every piece is provably under it.
 
 It is read-only. No flag changes anything in the organization, and the only
 thing it writes is an inventory file, which needs --apply.
@@ -28,7 +25,9 @@ thing it writes is an inventory file, which needs --apply.
         --out inventory.csv --format csv --apply
 
 Exit codes: 0 a complete census, 1 the census did NOT reconcile and its total
-is a floor, 2 the census could not be completed, 64 usage error.
+is a floor, 2 the census could not be completed, 64 usage error (a mistyped or
+unknown flag included), 73 the census ran but the inventory file could not be
+written.
 """
 
 from __future__ import print_function
@@ -72,6 +71,12 @@ DAY_MS = 86400000
 # the root partition starts here rather than at a date somebody has to maintain.
 EPOCH_START_MS = 0
 
+# End of the tail partition that covers everything created after the census
+# started: 9999-12-31T23:59:59.999Z. The root partition stops at this machine's
+# clock reading, so an item created during the run, or on a portal whose clock
+# is ahead of this one, would otherwise be missing with no warning.
+FAR_FUTURE_MS = 253402300799999
+
 # Ceiling on how many partitions one census may visit. A portal that reports the
 # cap for every query no matter how narrow would otherwise bisect until the
 # process dies. This turns that into a refusal with a partition query attached.
@@ -99,6 +104,19 @@ REDACTED = "[redacted]"
 # flag: argv is readable by every process on the box, and it lands in shell
 # history, in scheduler logs and in this tool's own error messages.
 SECRET_ENV = "ITEMCENSUS_PASSWORD"
+
+# Environment variable an existing token is read from when --token is not
+# given. --token still works, but the value on argv is readable by every
+# process on the box and is kept in process-creation audit logs and in shell
+# history, which is the reason the password has no flag at all.
+TOKEN_ENV = "ITEMCENSUS_TOKEN"
+
+# Exit status when the census finished but the inventory file could not be
+# written (sysexits EX_CANTCREAT). Not 1: exit 1 means the total is a floor.
+EXIT_WRITE_FAILED = 73
+
+# Exit status for a usage error, from the hand-written checks and from argparse.
+EXIT_USAGE = 64
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -387,15 +405,19 @@ def crawl_partition(fetch, query, num=SEARCH_MAX_NUM):
     while start is not None:
         page = fetch(query, start, size)
         if not isinstance(page, dict):
-            raise ValueError("fetch returned %r, which is not a search response"
-                             % (page,))
+            raise ValueError("fetch returned a %s, which is not a search "
+                             "response" % type(page).__name__)
         pages += 1
         totals.append(int(page.get("total") or 0))
         results = page.get("results") or []
         for raw in results:
             iid = raw.get("id")
             if not iid:
-                raise ValueError("a search result has no id: %r" % (raw,))
+                # Keys only. A secured-service row carries its url with a
+                # service token in the query string, and this message is printed.
+                raise ValueError("a search result has no id (it has the "
+                                 "fields: %s)" % ", ".join(sorted(
+                                     "%s" % key for key in raw)))
             # Union by id. Two partitions that overlap, because an item was
             # edited between them or because the server's created filter is
             # fuzzy at the boundary, contribute that item once.
@@ -441,9 +463,14 @@ def census(fetch, base="", owners=(), types=BISECT_TYPES, now_ms=None,
         now_ms = int(time.time() * 1000)
     if max_partitions < 1:
         raise ValueError("--max-partitions must be at least 1")
-    root = Partition(base, EPOCH_START_MS, int(now_ms),
+    now_ms = int(now_ms)
+    root = Partition(base, EPOCH_START_MS, now_ms,
                      owners=tuple(owners), types=tuple(types))
-    pending = [root]
+    # The tail goes in first so it is read last, after the root.
+    tail = Partition(base, now_ms + 1, FAR_FUTURE_MS,
+                     owners=tuple(owners), types=tuple(types))
+    pending = [tail, root]
+    late = 0
     items = {}
     done = []
     warnings = []
@@ -480,10 +507,18 @@ def census(fetch, base="", owners=(), types=BISECT_TYPES, now_ms=None,
 
         warnings.extend(reconcile(query, totals, len(got)))
         items.update(got)
+        if part.lo > now_ms:
+            late += len(got)
         done.append((query, total, len(got)))
         if echo:
             echo("  %d item(s) from %s" % (len(got), query))
 
+    if late:
+        warnings.append(
+            "%d item(s) were created after this machine's clock read %d, "
+            "either while the census ran or on a portal whose clock is ahead "
+            "of this one. They are in the inventory, but the organization "
+            "changed during the run" % (late, now_ms))
     return Census(items, done, warnings, bisections, pages)
 
 
@@ -580,7 +615,12 @@ def redact(text, *secrets):
             # Coerced because this runs inside an exception handler. A secret
             # that arrived as anything but a string used to raise TypeError
             # here, which threw away the redaction along with the error.
-            out = out.replace("%s" % (secret,), REDACTED)
+            raw = "%s" % (secret,)
+            # urllib quotes a request path back with the query percent-encoded,
+            # so a token holding + / or = survives a replace of the raw text.
+            for form in (raw, urllib.parse.quote_plus(raw),
+                         urllib.parse.quote(raw, safe="")):
+                out = out.replace(form, REDACTED)
     return out
 
 
@@ -665,6 +705,8 @@ def _call(url, path, params, insecure=False, post=False, secret=None):
                            % (endpoint, type(body).__name__))
     if "error" in body:
         err = body["error"]
+        if not isinstance(err, dict):
+            err = {"message": err}
         raise RuntimeError(redact("%s: %s %s" % (endpoint, err.get("code"),
                                                  err.get("message")), secret,
                                   params.get("token"), params.get("password")))
@@ -855,8 +897,10 @@ def self_test(_nested=False):
         noise, sys.stderr = sys.stderr, io.StringIO()
         try:
             _parse(argv)
-        except SystemExit:
-            check(True, label)
+        except SystemExit as exc:
+            check(exc.code == EXIT_USAGE,
+                  label if exc.code == EXIT_USAGE
+                  else "%s (exit %s, not %d)" % (label, exc.code, EXIT_USAGE))
         else:
             check(False, "%s (argparse accepted it)" % label)
         finally:
@@ -1266,11 +1310,13 @@ def self_test(_nested=False):
     plain = Catalog(rows(250))
     result = census(plain, base="orgid:ORG123", now_ms=NOW, types=())
     check(result.total == 250, "a 250 item org counts to 250")
-    check(len(result.partitions) == 1 and result.bisections == 0,
-          "an org under the ceiling needs one partition and no bisect")
+    check(len(result.partitions) == 2 and result.bisections == 0,
+          "an org under the ceiling needs one partition and no bisect, plus "
+          "the tail partition that proves nothing was created after the "
+          "clock reading")
     check(result.reconciled is True, "and it reconciles")
     check(result.warnings == [], "with no warnings")
-    check(result.pages == 3, "three pages were read")
+    check(result.pages == 4, "three pages for the org and one for the tail")
     check(result.partitions[0][1] == 250 and result.partitions[0][2] == 250,
           "the partition records what the server reported and what it returned")
     check(repr(result).startswith("Census(total=250"),
@@ -1279,11 +1325,33 @@ def self_test(_nested=False):
     none_at_all = census(Catalog([]), base="orgid:ORG123", now_ms=NOW, types=())
     check(none_at_all.total == 0 and none_at_all.reconciled is True,
           "an empty org counts to zero and reconciles")
-    check(len(none_at_all.partitions) == 1,
-          "an empty org still needs its one partition")
+    check(len(none_at_all.partitions) == 2,
+          "an empty org still needs its one partition and its tail")
     just_one = census(Catalog(rows(1)), base="orgid:ORG123", now_ms=NOW, types=())
     check(just_one.total == 1 and just_one.reconciled is True,
           "an org of exactly one item counts to one")
+
+    # An item created after the clock reading the root partition stops at: made
+    # while the census runs, or on a portal whose clock is ahead of this one.
+    # Before the tail partition it was missing from the inventory, and the run
+    # said every partition reconciled and exited 0.
+    ahead = rows(5) + [dict(rows(1)[0], id="late1", created=NOW + 1000)]
+    behind = Catalog(ahead)
+    skewed = census(behind, base="orgid:ORG123", now_ms=NOW, types=())
+    check(skewed.total == 6 and "late1" in skewed.items,
+          "an item created after the clock reading is still counted  "
+          "<-- pinned defect")
+    check(skewed.reconciled is False and exit_code(skewed) == 1,
+          "and the census says the org changed during the run, so it exits 1 "
+          "instead of reporting a clean total  <-- pinned defect")
+    check(any("1 item(s) were created after" in w for w in skewed.warnings),
+          "and the warning counts the late items")
+    check(any("created:[%d TO %d]" % (NOW + 1, FAR_FUTURE_MS) in call[0]
+              for call in behind.calls),
+          "the tail partition runs from the clock reading to the far future")
+    check(census(Catalog(rows(5)), base="orgid:ORG123", now_ms=NOW,
+                 types=()).reconciled is True,
+          "an org with nothing after the clock reading still reconciles")
 
     # THE HEADLINE CASE: an org past the ceiling, which every other tool
     # reports as 10,000 and calls done.
@@ -1297,9 +1365,9 @@ def self_test(_nested=False):
           "an org of 10,400 items counts to 10,400, not to the 10,000 the "
           "server reported  <-- pinned defect")
     check(huge.bisections >= 1, "getting there needed at least one bisect")
-    check(len(huge.partitions) == huge.bisections + 1,
+    check(len(huge.partitions) == huge.bisections + 2,
           "one more finished partition than bisections, which is what a binary "
-          "split of the org produces")
+          "split of the org produces, plus the tail")
     check(huge.reconciled is True,
           "every finished partition reconciled against the server's own count")
     check(all(p[1] < SEARCH_CEILING for p in huge.partitions),
@@ -1373,7 +1441,8 @@ def self_test(_nested=False):
 
     # A total that moves under the census, which is a warning and not a silent
     # overwrite of the number that was read first.
-    moving = Catalog(rows(250), moving=[250, 251, 252])
+    # The fourth call is the empty tail partition, which reports no movement.
+    moving = Catalog(rows(250), moving=[250, 251, 252, 0])
     drifted = census(moving, base="orgid:ORG123", now_ms=NOW, types=())
     check(drifted.total == 250,
           "the census reports the ids it actually read, not the total that "
@@ -1406,6 +1475,8 @@ def self_test(_nested=False):
     seen = {"n": 0}
 
     def overlapping_fetch(query, start, num):
+        if "created:[%d TO" % (NOW + 1) in query:
+            return {"total": 0, "results": [], "nextStart": -1}
         seen["n"] += 1
         if seen["n"] == 1:
             return {"total": SEARCH_CEILING, "results": [], "nextStart": -1}
@@ -1414,8 +1485,9 @@ def self_test(_nested=False):
     check(union.total == 2,
           "two partitions that both return the same two items count two, not "
           "four  <-- pinned defect")
-    check(len(union.partitions) == 2 and union.bisections == 1,
-          "the overlap came from two real partitions after one bisect")
+    check(len(union.partitions) == 3 and union.bisections == 1,
+          "the overlap came from two real partitions after one bisect, and "
+          "the tail")
     check(sum(p[2] for p in union.partitions) == 4,
           "the partitions did return four rows between them, which is what the "
           "union by id absorbed")
@@ -1506,7 +1578,7 @@ def self_test(_nested=False):
 
     # ---- rendering
     lines = describe(result)
-    check(lines[0].startswith("250 item(s), read in 1 partition(s)"),
+    check(lines[0].startswith("250 item(s), read in 2 partition(s)"),
           "the summary leads with the total and the partition count")
     check("0 bisection(s)" in lines[0],
           "the summary names how many bisections were needed")
@@ -1544,6 +1616,12 @@ def self_test(_nested=False):
 
     check(redact("token=SECRET1", "SECRET1") == "token=" + REDACTED,
           "a secret is removed before printing")
+    check(redact("q?token=AB%2BCD%2F%3DX&f=json", "AB+CD/=X")
+          == "q?token=" + REDACTED + "&f=json",
+          "a token holding + / or = is removed from the percent-encoded form "
+          "urllib quotes back in a bad-url error  <-- pinned defect")
+    check(redact("a b%20c", "a b c") == "a b%20c",
+          "a secret is only removed where it appears, not guessed at")
     check(redact("a=1", None, "") == "a=1",
           "a redact with nothing to remove leaves the text alone")
     check(redact("id 7 failed", 7) == "id %s failed" % REDACTED,
@@ -1796,6 +1874,25 @@ def self_test(_nested=False):
     check("hunter2" not in hidden,
           "and the password it carried is not in the message  <-- pinned defect")
 
+    encoded = fails(lambda: serving(
+        FakePortal(open_error=lambda t: ValueError("bad url %r" % t)),
+        lambda: org_id(PORTAL, "AB+CD/=X")),
+        "a request urllib refuses to open is raised")
+    check("AB%2B" not in encoded and "AB+CD" not in encoded
+          and REDACTED in encoded,
+          "and a token with + / = is not in the message in either spelling  "
+          "<-- pinned defect")
+
+    class StringError(FakePortal):
+        def _body(self, path, params):
+            return {"error": "maintenance window"}
+
+    texty = fails(lambda: serving(StringError(), lambda: org_id(PORTAL, None)),
+                  "a portal whose error is a bare string is raised, not an "
+                  "AttributeError")
+    check("maintenance window" in texty,
+          "and the string is reported  <-- pinned defect")
+
     expiring = FakePortal(Catalog(rows(250)), fail_search_after=1)
     dead = fails(lambda: serving(expiring, lambda: census(
         portal_fetch(PORTAL, "TESTTOKEN"), base="orgid:ORG123", now_ms=NOW,
@@ -1815,6 +1912,8 @@ def self_test(_nested=False):
 
     # ---- the command line, end to end
     workdir = tempfile.mkdtemp(prefix="itemcensus-selftest-")
+    # An ambient token would turn every anonymous run below into a signed-in one.
+    ambient_token = os.environ.pop(TOKEN_ENV, "")
     try:
         out_json = os.path.join(workdir, "inventory.json")
         out_csv = os.path.join(workdir, "nested", "inventory.csv")
@@ -1835,13 +1934,17 @@ def self_test(_nested=False):
         # so it is an exit code and a message. Before this it was an uncaught
         # ValueError and a traceback with the query in it.
         idless = FakePortal(lambda q, s, n: {"total": 1, "nextStart": -1,
-                                             "results": [{"title": "no id"}]})
+                                             "results": [{"title": "no id",
+                                                          "url": "https://h/s?token=SVCTOKEN"}]})
         code, seen = captured(lambda: serving(idless, lambda: main(
             ["--url", PORTAL, "--token", "TESTTOKEN", "--query", "orgid:X"])))
         check(code == 2, "a search result with no id exits 2, not a traceback  "
                          "<-- pinned defect")
         check("error:" in seen and "no id" in seen,
               "and says what the portal sent that it would not accept")
+        check("SVCTOKEN" not in seen and "title" in seen,
+              "without quoting the row, whose service url can carry a token  "
+              "<-- pinned defect")
 
         code, seen = captured(lambda: serving(
             FakePortal(Catalog(rows(250)), users=["ann"]),
@@ -2074,7 +2177,57 @@ def self_test(_nested=False):
               "an anonymous run reads no user list, because the portal would "
               "refuse it, and the bisect falls back on item type")
 
+        # a token from the environment, so it never has to be on argv
+        env_portal = FakePortal(Catalog(rows(10)), users=["ann"])
+        os.environ[TOKEN_ENV] = "ENVTOKEN"
+        try:
+            code, seen = captured(lambda: serving(env_portal, lambda: main(
+                ["--url", PORTAL])))
+            env_over = FakePortal(Catalog(rows(10)), users=["ann"])
+            captured(lambda: serving(env_over, lambda: main(
+                ["--url", PORTAL, "--token", "FLAGTOKEN"])))
+        finally:
+            del os.environ[TOKEN_ENV]
+        check(code == 0 and any("token=ENVTOKEN" in t
+                                for t in env_portal.targets),
+              "a token in %s is used when --token is not given  <-- pinned "
+              "defect" % TOKEN_ENV)
+        check("ENVTOKEN" not in seen, "and is not printed")
+        check(any("token=FLAGTOKEN" in t for t in env_over.targets)
+              and not any("ENVTOKEN" in t for t in env_over.targets),
+              "--token wins over the environment")
+
+        # an inventory that cannot be written. The census is complete, so this
+        # is neither exit 1 (the total is a floor) nor a traceback.
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(10)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", workdir, "--apply"])))
+        check(code == EXIT_WRITE_FAILED and "could not write" in seen
+              and "Traceback" not in seen and "10 item(s)" in seen,
+              "an --out that is a directory exits %d with a message, not a "
+              "traceback and not exit 1  <-- pinned defect" % EXIT_WRITE_FAILED)
+        unencodable = rows(1)
+        unencodable[0]["title"] = chr(0xd800)
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(unencodable), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", os.path.join(workdir, "lone.csv"),
+                          "--format", "csv", "--apply"])))
+        check(code == EXIT_WRITE_FAILED and "could not write" in seen,
+              "a title that cannot be encoded as UTF-8 exits %d, not a "
+              "traceback  <-- pinned defect" % EXIT_WRITE_FAILED)
+
         # the usage errors that never reach the portal
+        exits = []
+        try:
+            captured(lambda: main(["--url", PORTAL, "--bogus"]))
+        except SystemExit as exc:
+            exits.append(exc.code)
+        check(exits == [EXIT_USAGE],
+              "an unknown flag exits %d, the usage code, not the 2 that means "
+              "the census could not be completed  <-- pinned defect"
+              % EXIT_USAGE)
         code, seen = captured(lambda: main([]))
         check(code == 64 and "--url is required" in seen,
               "no --url at all is a usage error")
@@ -2199,6 +2352,7 @@ def self_test(_nested=False):
               "a port nothing listens on exits 2 without the token")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        os.environ.update({TOKEN_ENV: ambient_token} if ambient_token else {})
 
     # ---- argument handling
     args = _parse(["--url", PORTAL])
@@ -2330,8 +2484,18 @@ def self_test(_nested=False):
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, which this tool reserves for 'the
+    census could not be completed'. A mistyped flag in a scheduled job must not
+    look like a portal failure."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="itemcensus.py",
         description="Inventory every item in an ArcGIS organization, and "
                     "refuse to report a total the server cannot prove is "
@@ -2346,7 +2510,10 @@ def _parse(argv):
     ap.add_argument("--query",
                     help="search query to census (default: orgid of the "
                          "signed-in org)")
-    ap.add_argument("--token", help="an existing portal token")
+    ap.add_argument("--token",
+                    help="an existing portal token. Prefer %s: a value on "
+                         "argv is readable by every process on the box and is "
+                         "kept in shell history and audit logs." % TOKEN_ENV)
     ap.add_argument("--username",
                     help="generate a token for this user. The password comes "
                          "from %s or an unechoed prompt, never from argv."
@@ -2376,8 +2543,9 @@ def _parse(argv):
 
 def _authenticate(args):
     """Return a token, or None for an anonymous read."""
-    if args.token:
-        return args.token
+    token = args.token or os.environ.get(TOKEN_ENV)
+    if token:
+        return token
     if not args.username:
         return None
     secret = read_secret(args.username)
@@ -2393,26 +2561,26 @@ def main(argv=None):
     if not args.url:
         print("error: --url is required. Use --self-test to verify the tool "
               "without a portal.", file=sys.stderr)
-        return 64
+        return EXIT_USAGE
     if not is_http_url(args.url):
         print("error: --url must start with https:// or http://, got %r. "
               "urllib quotes a url it cannot open back into its own error, "
               "and that url carries the token." % args.url, file=sys.stderr)
-        return 64
+        return EXIT_USAGE
     if args.apply and not args.out:
         print("error: --apply needs --out, the file to write the inventory to.",
               file=sys.stderr)
-        return 64
+        return EXIT_USAGE
     if args.insecure and args.username:
         print("error: --insecure with --username would post your password down "
               "an unverified connection. Pass --token instead.", file=sys.stderr)
-        return 64
+        return EXIT_USAGE
     if args.num < 1:
         print("error: --num must be at least 1.", file=sys.stderr)
-        return 64
+        return EXIT_USAGE
     if args.max_partitions < 1:
         print("error: --max-partitions must be at least 1.", file=sys.stderr)
-        return 64
+        return EXIT_USAGE
 
     try:
         token = _authenticate(args)
@@ -2463,7 +2631,18 @@ def main(argv=None):
         else:
             writer = write_csv if args.format == "csv" else write_json
             print("")
-            print("wrote %s" % writer(document, args.out))
+            try:
+                print("wrote %s" % writer(document, args.out))
+            except (OSError, UnicodeError) as exc:
+                # A locked file, a read-only folder, a directory named as the
+                # file, a full disk, a title that is not encodable. The census
+                # above is complete, so this is not exit 1 or 2.
+                print(printable("error: could not write %s: %s. The census "
+                                "above finished; fix the path and run again."
+                                % (args.out, exc),
+                                getattr(sys.stderr, "encoding", None)),
+                      file=sys.stderr)
+                return EXIT_WRITE_FAILED
 
     return exit_code(result)
 
