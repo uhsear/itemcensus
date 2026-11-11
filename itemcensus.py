@@ -576,8 +576,12 @@ def build_inventory(url, query, taken, result):
     }
 
 
-def describe(result):
-    """Render a census as the lines the CLI prints."""
+def describe(result, anonymous=False):
+    """Render a census as the lines the CLI prints.
+
+    anonymous is True when no token was used. The search then sees only public
+    items, and "reconciled" would read as a statement about the whole org.
+    """
     out = ["%d item(s), read in %d partition(s) over %d page(s), %d bisection(s)"
            % (result.total, len(result.partitions), result.pages,
               result.bisections)]
@@ -596,6 +600,12 @@ def describe(result):
                    "rows returned,")
         out.append("on every page, and no partition sat on the %d ceiling."
                    % SEARCH_CEILING)
+    if anonymous:
+        out.append("")
+        out.append("NOTE: no token was used, so only public items were visible. "
+                   "This total is not")
+        out.append("the organization's, and exit 0 does not mean every item "
+                   "was seen.")
     return out
 
 
@@ -725,6 +735,26 @@ def _call(url, path, params, insecure=False, post=False, secret=None):
     return body
 
 
+def console_missing(is_windows=None, opener=None):
+    """True on Windows when the process has no console to prompt on.
+
+    Without a console msvcrt.getwch() returns U+FFFF instead of raising, and
+    getpass.win_getpass loops on it for ever, so an unattended run hung instead
+    of reaching the EOFError branch. CONIN$ names the console input buffer
+    (Microsoft, "Console Handles"). Opening it failed in a detached child
+    process, which is how a missing console shows.
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows:
+        return False
+    try:
+        os.close((opener or os.open)("CONIN$", os.O_RDONLY))
+    except OSError:
+        return True
+    return False
+
+
 def read_secret(username):
     """Get the password from the environment, or prompt for it.
 
@@ -734,6 +764,8 @@ def read_secret(username):
     secret = os.environ.get(SECRET_ENV)
     if secret:
         return secret
+    if console_missing():
+        raise EOFError("no console to prompt on")
     return getpass.getpass("password for %s (not echoed): " % username)
 
 
@@ -1751,9 +1783,16 @@ def self_test(_nested=False):
         """A stdout that reports an encoding, the way a real console does."""
         encoding = "utf-8"
 
-    def captured(fn, encoding="utf-8"):
+    class StrictConsole(Console):
+        """A console that raises on a character its encoding cannot hold."""
+
+        def write(self, text):
+            text.encode(self.encoding)
+            return Console.write(self, text)
+
+    def captured(fn, encoding="utf-8", console_class=Console):
         """Run fn with stdout and stderr collected. Returns (result, text)."""
-        console = Console()
+        console = console_class()
         console.encoding = encoding
         saved = (sys.stdout, sys.stderr)
         sys.stdout, sys.stderr = console, console
@@ -2026,6 +2065,54 @@ def self_test(_nested=False):
               "a run with no password and no console exits 2 and names %s, "
               "not a traceback and exit 1  <-- pinned defect" % SECRET_ENV)
 
+        # Windows with no console: getpass would loop for ever, so the check
+        # runs first. The stand-in getpass records any call it gets.
+        prompted = []
+
+        real_missing = globals()["console_missing"]
+        globals()["console_missing"] = lambda: True
+        getpass.getpass = lambda prompt: prompted.append(prompt) or "x"
+        os.environ.pop(SECRET_ENV, None)
+        try:
+            code, seen = captured(lambda: main(
+                ["--url", PORTAL, "--username", "gis_admin"]))
+        finally:
+            globals()["console_missing"] = real_missing
+            getpass.getpass = real_getpass
+            os.environ.clear()
+            os.environ.update(ambient_env)
+        check(code == 2 and SECRET_ENV in seen and not prompted,
+              "a Windows run with no console never prompts, and exits 2 "
+              "naming %s  <-- pinned defect" % SECRET_ENV)
+        pipe_read, pipe_write = os.pipe()
+        os.close(pipe_write)
+
+        def refuse(name, flags):
+            raise OSError("no console")
+
+        check(console_missing(False, refuse) is False
+              and console_missing(True, refuse) is True
+              and console_missing(True, lambda n, f: pipe_read) is False,
+              "console_missing is False off Windows, True when CONIN$ will not "
+              "open, False when it opens")
+        check(isinstance(console_missing(), bool),
+              "console_missing answers on this host without raising")
+
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(250)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--query", "orgid:X"])))
+        check(code == 0 and "250 item(s)" in seen
+              and "no token was used" in seen
+              and "does not mean every item was seen" in seen
+              and "Every partition reconciled" in seen,
+              "an anonymous run says it saw public items only, "
+              "though it exits 0  <-- pinned defect")
+        check("no token was used" not in captured(lambda: serving(
+            FakePortal(Catalog(rows(10)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--query", "orgid:X"])))[1],
+              "a run with a token carries no anonymous note")
+
         code, seen = captured(lambda: serving(
             FakePortal(Catalog(rows(250)), users=["ann"]),
             lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
@@ -2297,6 +2384,20 @@ def self_test(_nested=False):
         check(code == EXIT_WRITE_FAILED and "could not write" in seen,
               "a title that cannot be encoded as UTF-8 exits %d, not a "
               "traceback  <-- pinned defect" % EXIT_WRITE_FAILED)
+
+        # A console that cannot encode the --out path. The file is written in
+        # full, so the run must say so and keep the census exit code.
+        accent_out = os.path.join(workdir, "caf" + chr(0xe9) + ".json")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(10)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", accent_out, "--apply"])),
+            encoding="ascii", console_class=StrictConsole)
+        check(code == 0 and os.path.exists(accent_out)
+              and "could not write" not in seen and "wrote " in seen,
+              "an --out path the console cannot encode reports the finished "
+              "write and exits with the census code, not 73 and not a "
+              "traceback  <-- pinned defect")
 
         # the usage errors that never reach the portal
         exits = []
@@ -2712,7 +2813,7 @@ def main(argv=None):
 
     print("")
     encoding = getattr(sys.stdout, "encoding", None)
-    for line in describe(result):
+    for line in describe(result, anonymous=token is None):
         print(printable(line, encoding))
 
     if args.out:
@@ -2726,7 +2827,7 @@ def main(argv=None):
             writer = write_csv if args.format == "csv" else write_json
             print("")
             try:
-                print("wrote %s" % writer(document, args.out))
+                written = writer(document, args.out)
             except (OSError, UnicodeError) as exc:
                 # A locked file, a read-only folder, a directory named as the
                 # file, a full disk, a title that is not encodable. The census
@@ -2737,6 +2838,9 @@ def main(argv=None):
                                 getattr(sys.stderr, "encoding", None)),
                       file=sys.stderr)
                 return EXIT_WRITE_FAILED
+            # Outside the try: a console that cannot encode the path must not
+            # turn a finished write into "could not write" and exit 73.
+            print(printable("wrote %s" % written, encoding))
 
     return exit_code(result)
 

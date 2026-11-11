@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 432 lines, 428 of them assertions. Here are the first fourteen and the last
+A real run prints 438 lines, 434 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-428 assertions, 0 failed
+434 assertions, 0 failed
 ```
 
 ## Requirements
@@ -180,8 +180,9 @@ by both halves of a split it straddles.
 ## Why the obvious version is wrong
 
 The ArcGIS API for Python is the obvious tool and it is good at what it does.
-`gis.content.search` takes a `max_items`, `advanced_search` pages for you, and both are far less
-code than this. What they do not give you is a statement that what came back was everything.
+`gis.content.search` takes a `max_items`, and `advanced_search` takes a `max_items` documented as
+up to 10,000, a `start` and a `return_count` (both are in the ArcGIS API for Python reference
+listed under References). Both are far less code than this. What they do not give you is a statement that what came back was everything.
 That is the whole of what this tool adds, and it is not paging. It is proof: it compares the
 server's own count with the rows read, partition by partition, and refuses when they cannot
 agree. This README makes no claim about how those two methods behave past 10,000 items, because
@@ -383,7 +384,8 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   with a Python traceback and exit 1, which this README does not define as "did not reconcile".
   The check-only run stops too, because the inventory is built before `--apply` is looked at.
   Other wrong JSON shapes inside an otherwise valid object, such as a users row that is not an
-  object or a `total` of `1e999`, end the same way.
+  object, end the same way. A `total` of `1e999` is rejected as "not a search response" and
+  exits 2.
 - A search answer with no integer `total` or no `results` list, such as `{}` or a maintenance
   notice, aborts the census with exit 2 and the keys it had. It is never read as an empty
   organization.
@@ -404,13 +406,39 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   `sortField=created` and the end-of-results `nextStart` of `-1`.
 - A write failure after a census that did not reconcile exits 73, not 1. Read the printed
   warnings, not only the exit code.
-- With `--username` and no `ITEMCENSUS_PASSWORD` the tool prompts and waits for a console, and
-  on Windows it waits even with stdin redirected. An unattended job must export the variable.
-  With no console at all the run exits 2 and names the variable.
-- The tool uses the proxy named in the environment and follows HTTP redirects. A token in a
-  search url is visible to that proxy. It is not re-sent to a redirect target by the tool.
-- An `--out` path the console cannot encode writes the file and then ends with a Python
-  traceback. Set `PYTHONIOENCODING=utf-8`.
+- With `--username` and no `ITEMCENSUS_PASSWORD` the tool prompts for the password. On Windows
+  the prompt reads the console, not stdin, so a run that has a console waits even with stdin
+  redirected. An unattended job must export the variable. A run with no console at all (a
+  process started with `DETACHED_PROCESS`, as a scheduler can) exits 2 and names the variable.
+  That was run for real with a detached child process. The self-test asserts it only with a
+  stand-in for the console check, so it does not test the detached launch itself. Python's
+  `getpass` would loop for ever there, which is why the tool checks first.
+- The tool uses the proxy named in the environment, as urllib's default opener does, and
+  follows HTTP redirects. No assertion covers either. A proxy that logs request urls sees the
+  token. The tool does not copy the token into a redirect on its own, and a 302 with no query
+  was tested by hand, but a `Location` that carries the same query string hands the token to
+  the target.
+- An `--out` path the console cannot encode is written in full. The `wrote` line shows `?`
+  for the characters it cannot print, and the exit code is the census code. The self-test
+  asserts this against a console that raises on an unencodable character.
+- An anonymous run (no token) prints a note that only public items were visible and still
+  exits 0, because the search agreed with itself. Exit 0 there does not mean the whole
+  organization was seen.
+- A token sent to an `http://` url travels in clear text in the query string. Use `https://`.
+- A text cell that starts with a space and then a trigger character (` =1`) is not guarded.
+  The CSV guard also assumes the text fields arrive as JSON strings, so a number sent as a
+  title is written as it is. Real portals send strings.
+- A missing or null `size`, `numViews`, `created` or `modified` is written as `0`, and a float
+  `size` is cut to an integer. A missing `access` is written as `private`. "as they were reported" holds for the numbers a portal sends.
+- An item whose `created` is negative falls outside every partition and is dropped without a
+  warning. The partitions start at 0 and no real item is older.
+- An owner or type name is quoted only when it has a space, colon or parenthesis. A backslash
+  (a domain login) or a wildcard reaches the search query unescaped, and Esri's escaping rules
+  for those were not checked. The self-test pins the unescaped form against a synthetic
+  evaluator.
+- The first owner split puts half of the owner list into one query. No test measures query
+  length, so a proxy or web server with a short query-string limit would answer with an HTTP
+  error and the run would exit 2, not print a total.
 - A token travels in the query string of each search request, which is where Esri's search
   endpoint expects it. Anything that logs request urls on the portal or on a proxy will see it.
 - `--url http://...` together with `--username` posts the password over cleartext HTTP. Only
@@ -440,16 +468,16 @@ Measured on 2026-11-11, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 428, 0 failed |
-| Windows | 3.12.10 | 428, 0 failed |
-| Windows | 3.10.20 | 428, 0 failed |
-| Windows | 3.9.25 | 428, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 428, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 428, 0 failed |
+| Windows | 3.13.2 | 434, 0 failed |
+| Windows | 3.12.10 | 434, 0 failed |
+| Windows | 3.10.20 | 434, 0 failed |
+| Windows | 3.9.25 | 434, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 434, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 434, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1297 statements, 214 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1342 statements, 222 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
@@ -469,6 +497,13 @@ summary goes red, and by running the file with `runpy` once as a script and once
   and the `-` prohibit operator that every complement split relies on.
 - OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the leading
   characters, and the single quote prefix as one of several mitigations.
+- Esri, [ArcGIS API for Python, arcgis.gis](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.toc.html):
+  the `max_items`, `start` and `return_count` parameters of `ContentManager.search` and
+  `advanced_search`, read on 2026-11-11.
+- Microsoft, [Consoles](https://learn.microsoft.com/en-us/windows/console/console-handles):
+  `CONIN$` opens the console input buffer even when stdin is redirected. The page does not say
+  what happens with no console. Opening it failed in a detached child process here, and that
+  is how the tool tells a no-console launch from one that can prompt.
 - Python, [csv](https://docs.python.org/3/library/csv.html): open the file with `newline=''`,
   and the writer's default line terminator is `\r\n`.
 
