@@ -16,7 +16,7 @@ looking for a layer that was never in the list.
 
 ```
 $ python itemcensus.py --self-test
-itemcensus self-test: no portal, no network, no credentials
+itemcensus self-test: no portal, no internet, no credentials
 --------------------------------------------------------------------
 PASS  a page size of 1000 is clamped to 100 before it is sent, because the server clamps it silently  <-- pinned defect
 PASS  exactly 10,000 is the CAP and never a total  <-- pinned defect
@@ -60,21 +60,31 @@ PASS  the token never reaches stdout  <-- pinned defect
 PASS  a search result with no id exits 2, not a traceback  <-- pinned defect
 PASS  no credential reaches the inventory file on disk  <-- pinned defect
 PASS  the csv has no blank line between rows, which is what newline='' prevents on windows  <-- pinned defect
+PASS  id starting with equals is written with a leading apostrophe  <-- pinned defect
+PASS  title starting with equals is written with a leading apostrophe  <-- pinned defect
+PASS  owner starting with equals is written with a leading apostrophe  <-- pinned defect
+PASS  a size of -1 stays the number -1, not the text '-1  <-- pinned defect
+PASS  a whole inventory round trips: write, read, strip one apostrophe, and every title and owner is what the portal sent  <-- pinned defect
+PASS  --format csv --apply guards every hostile title the portal returned, and a reader strips them back  <-- pinned defect
+PASS  and the titles it got off the wire are guarded the same way  <-- pinned defect
+PASS  an HTTP 500 from a real server exits 2 without the token
 PASS  a census that cannot be completed exits 2, and does not print a total  <-- pinned defect
 PASS  the command line counts an org past the ceiling  <-- pinned defect
 PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
 PASS  there is no --password attribute at all, because argv is readable by every process on the box  <-- pinned defect
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, a census that did not refuse, a census that raised the wrong thing, a portal call that did not fail and one that refused instead as nine failures, so a broken tool turns this self-test red  <-- pinned defect
+PASS  a tool with one broken function turns the whole self-test red: exit 1, and the summary names the assertion that failed
+PASS  run as a script, it exits with main()'s code: 64 for no --url
 --------------------------------------------------------------------
-317 assertions, 0 failed
+399 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `csv`, `os`, `ssl`, `io`,
-`argparse`, `datetime`, `getpass`, `time`, and `re`, `tempfile` and `shutil` inside the
-self-test. It runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the
+`argparse`, `datetime`, `getpass`, `time`, and `re`, `tempfile`, `shutil`, `http.server`,
+`threading` and `runpy` inside the self-test. It runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the
 `arcgis` package is not needed.
 
 ```
@@ -82,11 +92,14 @@ git clone https://github.com/uhsear/itemcensus.git
 python itemcensus.py --self-test
 ```
 
-`--self-test` needs no portal, no network and no credentials, so you can check the tool before
+`--self-test` needs no portal, no internet and no credentials, so you can check the tool before
 you point it at an organization. It covers the portal calls as well as the decisions: paging,
 sign-in, the 10,000 ceiling, all three bisect levels, a token that dies mid-crawl, an HTTP error,
-a 200 response carrying an ArcGIS error envelope, and the command line end to end, all against a
-stand-in portal that answers inside the process. No socket is opened.
+a 200 response carrying an ArcGIS error envelope, and the command line end to end, against a
+stand-in portal that answers inside the process. One section also starts a stub portal on
+`127.0.0.1` with `http.server` and runs the command line against it over a real socket: a
+`generateToken` POST, search GETs, an HTTP 500 and a port nothing listens on. That section
+needs the loopback interface and nothing else.
 
 ## Quick start
 
@@ -238,6 +251,26 @@ file records `"reconciled": false`.
 `--format csv` writes those nine columns and nothing else. Items are sorted by id in both, so two
 censuses of an unchanged organization produce the same bytes and `diff` is useful.
 
+### CSV and spreadsheet formulas
+
+A title, an owner and an id come from the portal, and anyone who can name an item chooses what
+lands in the file. The inventory is opened in Excel by the person who asked how many items
+there are. So in `--format csv`, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a
+carriage return gets one apostrophe in front of it. OWASP's CSV Injection page lists those
+leading characters and recommends the single quote prefix. Every text column is guarded: `id`,
+`title`, `owner`, `type` and `access`. The four number columns (`created`, `modified`, `size`,
+`numViews`) are never touched, so the `-1` the portal sends for an unknown size stays the number
+`-1`. JSON is not a spreadsheet format and is written as the portal sent it.
+
+```
+id,title,owner,type,created,modified,access,size,numViews
+item000001,"'=HYPERLINK(""http://x.invalid"")",jsmith,Web Map,1577836800000,1577836800005,org,-1,0
+```
+
+This tool never reads its own CSV back. Whatever does read it must strip exactly one leading
+apostrophe from a cell whose next character is one of those six. The self-test pins that round
+trip for every text column and every leading character, tab and carriage return included.
+
 The service url is dropped on the way in. A real `search` response carries one, and on a secured
 service it carries a token in its query string, which would otherwise sit in an inventory file
 for years. `--self-test` asserts that no credential reaches stdout or the file.
@@ -253,12 +286,54 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   reported, including the `-1` the portal uses for an unknown size.
 - No group membership. An item's groups need a call per group, which is `sharewatch`'s shape,
   not this one's.
+- Guard anything beyond those six leading characters. OWASP's page also lists a line feed and the
+  full-width forms of `=`, `+`, `-` and `@`. This tool follows the six the portfolio uses, so a
+  title that starts with a full-width equals sign is written as it came.
+- Tell a guarded cell from a title that really starts with an apostrophe. A title written `'=x`
+  is not changed, so a reader that strips one apostrophe turns it into `=x`. A self-test
+  assertion marked "known limit" pins that.
+- Promise the quote prefix survives a spreadsheet. The assertions are on the bytes in the file.
+  Nothing here opened Excel. OWASP warns the quote techniques are not reliable in Excel after
+  saving and re-opening a CSV, so treat the file as an inventory to read, and as input to
+  a script, not as a workbook to resave.
 - It cannot see items it is not allowed to see. An anonymous census counts public items, and a
   census run as a non-administrator counts what that user can search. The number is honest about
   the query, not about the organization.
 - More than 10,000 items created by one user, of one type, in one day cannot be counted by this
   method, because the search API offers nothing narrower to split on. That is the case it
   refuses, and the refusal names the exact query it gave up on.
+
+## Verification
+
+Measured on 2026-11-11, all against the same file.
+
+| Host | Python | Assertions |
+|---|---|---|
+| Windows | 3.13 | 399, 0 failed |
+| Windows | 3.12 | 399, 0 failed |
+| Windows | 3.9.25 | 399, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 399, 0 failed |
+
+The count is the same on every host. Branch coverage of `itemcensus.py` is 100 percent
+(`coverage run --branch itemcensus.py --self-test`, 1188 statements, 198 branches). The last
+branches are reached by running the whole self-test once with one function broken, to prove the
+summary goes red, and by running the file with `runpy` once as a script and once as a module.
+`pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
+`coverage` is not installed on the Linux host.
+
+## References
+
+- Esri, [Search](https://developers.arcgis.com/rest/users-groups-and-items/search/): `num`
+  maximum 100, `start` is the 1-based first result, `total` is counted accurately up to 10,000,
+  `nextStart`, and the top 10,000 results are the ones available through pagination.
+  `sortField` accepts `created`, `sortOrder` defaults to ascending.
+- Esri, [Search reference](https://developers.arcgis.com/rest/users-groups-and-items/search-reference/):
+  `created: [start TO end]` in epoch milliseconds with inclusive brackets, `orgid:`, `owner:`,
+  and the `-` prohibit operator that every complement split relies on.
+- OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the leading
+  characters and the single quote prefix.
+- Python, [csv](https://docs.python.org/3/library/csv.html): open the file with `newline=''`,
+  and the writer's default line terminator is `\r\n`.
 
 ## Contributing
 

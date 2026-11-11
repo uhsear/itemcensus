@@ -109,6 +109,11 @@ SECRET_ENV = "ITEMCENSUS_PASSWORD"
 CSV_FIELDS = ("id", "title", "owner", "type", "created", "modified", "access",
               "size", "numViews")
 
+# A text cell that starts with one of these is read by a spreadsheet as a
+# formula (OWASP, CSV Injection). A tuple and not a string, because "" in
+# "=+-@" is True and an empty cell must not be quoted.
+CSV_FORMULA_LEAD = ("=", "+", "-", "@", chr(9), chr(13))
+
 
 class CensusIncomplete(RuntimeError):
     """The organization could not be counted, so no total is returned.
@@ -748,6 +753,22 @@ def write_json(document, path):
     return path
 
 
+def cell(value):
+    """A CSV cell that a spreadsheet will not run as a formula.
+
+    A title, owner or id comes from the portal, and anyone who can name an item
+    can name it =HYPERLINK(...). The inventory is opened in Excel by the person
+    asking how many items there are. Text that starts with = + - @ tab or CR gets
+    one apostrophe in front. Numbers pass through untouched: size is -1 for an
+    unknown size, and that is a number, not a formula. Whoever reads this file
+    back strips exactly one leading apostrophe from a cell whose next character
+    is one of CSV_FORMULA_LEAD. This tool never reads its own CSV.
+    """
+    if isinstance(value, str) and value[:1] in CSV_FORMULA_LEAD:
+        return "'" + value
+    return value
+
+
 def write_csv(document, path):
     """Write the inventory as CSV and return the path.
 
@@ -760,7 +781,7 @@ def write_csv(document, path):
         writer = csv.writer(handle)
         writer.writerow(CSV_FIELDS)
         for record in document["items"]:
-            writer.writerow([record[field] for field in CSV_FIELDS])
+            writer.writerow([cell(record[field]) for field in CSV_FIELDS])
     return path
 
 
@@ -773,8 +794,8 @@ def _make_parent(path):
 
 # ------------------------------------------------------------------ self-test
 
-def self_test():
-    """Assertions over the census core. No portal, no network, no credentials."""
+def self_test(_nested=False):
+    """Assertions over the census core. No portal, no internet, no credentials."""
     import re
     import shutil
     import tempfile
@@ -841,7 +862,7 @@ def self_test():
         finally:
             sys.stderr = noise
 
-    print("itemcensus self-test: no portal, no network, no credentials")
+    print("itemcensus self-test: no portal, no internet, no credentials")
     print("-" * 68)
 
     DAY = DAY_MS
@@ -1530,7 +1551,7 @@ def self_test():
 
     # ---- the portal, answered in process
     #
-    # No socket is opened and no credential is real. _opener is swapped for a
+    # No credential is real. _opener is swapped for a
     # stand-in that answers the REST paths the portal answers, including the
     # failures that matter: a 200 carrying an error envelope, which is how
     # ArcGIS reports a dead token, and an exception out of urllib that quotes
@@ -1872,6 +1893,93 @@ def self_test():
               "prevents on windows  <-- pinned defect")
         check("TESTTOKEN" not in csv_text, "and carries no token")
 
+        # ---- a spreadsheet must not run an item's title as a formula
+        #
+        # Anyone who can name an item chooses a string that lands in a cell of
+        # the inventory, and the inventory is opened in Excel. The guard is one
+        # apostrophe in front of text that starts with = + - @ tab or CR.
+        leads = [("equals", "=HYPERLINK(" + chr(34) + "http://x.invalid" + chr(34) + ")"),
+                 ("plus", "+1+1"), ("minus", "-2+3"), ("at", "@SUM(1+1)"),
+                 ("tab", chr(9) + "=1+1"), ("cr", chr(13) + "=1+1")]
+
+        def unguard(text):
+            """What a reader of this csv does: strip exactly the one prefix."""
+            if text[:1] == "'" and text[1:2] in CSV_FORMULA_LEAD:
+                return text[1:]
+            return text
+
+        def one_item_csv(**fields):
+            record = item_record({"id": "item1", "title": "T", "owner": "o",
+                                  "type": "Web Map", "access": "org"})
+            record.update(fields)
+            doc = {"items": [record]}
+            path = write_csv(doc, os.path.join(workdir, "hostile.csv"))
+            with io.open(path, "r", encoding="utf-8", newline="") as handle:
+                text = handle.read()
+            return list(csv.reader(io.StringIO(text, newline="")))[1], text
+
+        for field in ("id", "title", "owner", "type", "access"):
+            for name, bad in leads:
+                row, _text = one_item_csv(**{field: bad})
+                got = row[CSV_FIELDS.index(field)]
+                check(got == "'" + bad,
+                      "%s starting with %s is written with a leading "
+                      "apostrophe  <-- pinned defect" % (field, name))
+                check(unguard(got) == bad,
+                      "and stripping that one apostrophe restores the %s "
+                      "exactly" % field)
+
+        row, text = one_item_csv(title=leads[0][1], size=-1, numViews=0)
+        check(row[CSV_FIELDS.index("size")] == "-1",
+              "a size of -1 stays the number -1, not the text '-1  "
+              "<-- pinned defect")
+        check(all(row[CSV_FIELDS.index(f)].lstrip("-").isdigit()
+                  for f in ("created", "modified", "size", "numViews")),
+              "every numeric column stays numeric")
+        check(row[CSV_FIELDS.index("owner")] == "o"
+              and row[CSV_FIELDS.index("type")] == "Web Map",
+              "an ordinary cell is written as it is")
+        check(cell("") == "" and cell(0) == 0 and cell(-1) == -1,
+              "an empty cell is not quoted and a number is not turned into text")
+        check(cell("a=b") == "a=b" and cell("x-y") == "x-y",
+              "a trigger character past the first is left alone")
+        check(cell(" =1") == " =1",
+              "a leading space is not a trigger, so the guard is exactly the six "
+              "characters and not a guess")
+        check(cell("'=x") == "'=x" and unguard(cell("'=x")) == "=x",
+              "known limit: a title that already starts with an apostrophe "
+              "then a trigger is written as it is, so a reader that strips "
+              "cannot tell it from a guarded one")
+        row, text = one_item_csv(title=leads[5][1])
+        check(len(row) == len(CSV_FIELDS)
+              and chr(34) + "'" + chr(13) + "=1+1" + chr(34) in text,
+              "a guarded cell that starts with CR is quoted whole, so it "
+              "cannot split the row")
+
+        hostile_doc = build_inventory(PORTAL, "q", "t", census(
+            Catalog(rows(3)), base="orgid:ORG123", now_ms=NOW, types=()))
+        hostile_doc["items"][0].update(title=leads[0][1], owner=leads[4][1])
+        hostile_json = write_json(hostile_doc,
+                                  os.path.join(workdir, "hostile.json"))
+        with io.open(hostile_json, "r", encoding="utf-8") as handle:
+            check(json.load(handle)["items"][0]["title"] == leads[0][1],
+                  "json is not a spreadsheet format and keeps the title "
+                  "unquoted")
+        round_csv = write_csv(hostile_doc, os.path.join(workdir, "round.csv"))
+        with io.open(round_csv, "r", encoding="utf-8", newline="") as handle:
+            back = list(csv.DictReader(handle))
+        check([unguard(r["title"]) for r in back]
+              == [r["title"] for r in hostile_doc["items"]]
+              and [unguard(r["owner"]) for r in back]
+              == [r["owner"] for r in hostile_doc["items"]],
+              "a whole inventory round trips: write, read, strip one "
+              "apostrophe, and every title and owner is what the portal sent  "
+              "<-- pinned defect")
+        check(all(r["title"][:1] not in CSV_FORMULA_LEAD for r in back)
+              and all(r["owner"][:1] not in CSV_FORMULA_LEAD for r in back),
+              "and not one title or owner in the file starts with a formula "
+              "character")
+
         code, seen = captured(lambda: serving(
             FakePortal(Catalog(rows(250), moving=[250, 251, 252]),
                        users=["ann"]),
@@ -1988,6 +2096,107 @@ def self_test():
             ["--url", PORTAL, "--max-partitions", "0"]))
         check(code == 64 and "--max-partitions" in seen,
               "a --max-partitions of zero is a usage error")
+
+        # ---- a hostile title all the way through the command line
+        bad_rows = rows(6)
+        for bad, (_name, text) in zip(bad_rows, leads):
+            bad["title"] = text
+        bad_rows[0]["owner"] = leads[1][1]
+        bad_rows[1]["size"] = -1
+        hostile_csv = os.path.join(workdir, "cli-hostile.csv")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(bad_rows), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", hostile_csv, "--format", "csv",
+                          "--apply"])))
+        with io.open(hostile_csv, "r", encoding="utf-8", newline="") as handle:
+            cli_rows = list(csv.DictReader(handle))
+        check(code == 0 and len(cli_rows) == 6
+              and sorted(unguard(r["title"]) for r in cli_rows)
+              == sorted(t for _n, t in leads)
+              and all(r["title"][:1] not in CSV_FORMULA_LEAD for r in cli_rows),
+              "--format csv --apply guards every hostile title the portal "
+              "returned, and a reader strips them back  <-- pinned defect")
+        check(sorted(r["size"] for r in cli_rows)[0] == "-1",
+              "and the size of -1 the portal reported is still the number")
+
+        # ---- the same run over a real socket
+        #
+        # Everything above swaps _opener for an in-process stand-in, so urllib's
+        # own request, status and body handling never ran. This one serves the
+        # same stand-in from http.server on 127.0.0.1 and lets the real opener
+        # talk to it: a GET search, a POST generateToken, an HTTP 500, and a
+        # port nothing listens on.
+        import http.server
+        import threading
+
+        stub = FakePortal(Catalog(bad_rows), users=["ann"])
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self, path, query):
+                if "boom" in query:
+                    self.send_error(500)
+                    return
+                body = json.dumps(stub._body(path, dict(
+                    urllib.parse.parse_qsl(query)))).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                path, _sep, query = self.path.partition("?")
+                self._answer(path, query)
+
+            def do_POST(self):
+                size = int(self.headers["Content-Length"])
+                self._answer(self.path, self.rfile.read(size).decode("utf-8"))
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        local = "http://127.0.0.1:%d" % server.server_address[1]
+        socket_csv = os.path.join(workdir, "socket.csv")
+        os.environ[SECRET_ENV] = "hunter2"
+        try:
+            code, seen = captured(lambda: main(
+                ["--url", local, "--username", "gis_admin", "--out",
+                 socket_csv, "--format", "csv", "--apply"]))
+        finally:
+            del os.environ[SECRET_ENV]
+        with io.open(socket_csv, "r", encoding="utf-8", newline="") as handle:
+            socket_rows = list(csv.DictReader(handle))
+        check(code == 0 and "6 item(s)" in seen and len(socket_rows) == 6,
+              "a census over a real socket signs in, counts and writes the csv")
+        check(sorted(unguard(r["title"]) for r in socket_rows)
+              == sorted(t for _n, t in leads)
+              and all(r["title"][:1] not in CSV_FORMULA_LEAD
+                      for r in socket_rows),
+              "and the titles it got off the wire are guarded the same way  "
+              "<-- pinned defect")
+        with io.open(socket_csv, "r", encoding="utf-8") as handle:
+            socket_text = handle.read()
+        check("hunter2" not in seen + socket_text
+              and "TESTTOKEN" not in seen + socket_text,
+              "neither the password nor the token it was issued reached "
+              "stdout or the file")
+        check(stub.searches > 0, "the stub answered real search requests")
+        code, seen = captured(lambda: main(
+            ["--url", local, "--token", "TESTTOKEN", "--query", "boom"]))
+        check(code == 2 and "TESTTOKEN" not in seen,
+              "an HTTP 500 from a real server exits 2 without the token")
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        code, seen = captured(lambda: main(
+            ["--url", local, "--token", "TESTTOKEN"]))
+        check(code == 2 and "TESTTOKEN" not in seen and "error:" in seen,
+              "a port nothing listens on exits 2 without the token")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -2070,6 +2279,43 @@ def self_test():
     check(returned == ["", "", ""],
           "a portal call that did not fail the right way yields no message to "
           "assert on")
+
+    # ---- the whole self-test has to be able to report red
+    #
+    # The probe above proves the harness records a failure. This proves the
+    # summary a person reads does too: a tool with one broken function, run
+    # through the real self_test(), must exit 1 and name what failed. The inner
+    # run skips this block, or it would recurse for ever.
+    if not _nested:
+        saved_fn = globals()["is_http_url"]
+        globals()["is_http_url"] = lambda url: True
+        try:
+            broken, broken_out = captured(lambda: self_test(_nested=True))
+        finally:
+            globals()["is_http_url"] = saved_fn
+        check(broken == 1 and "FAILED: a url with no scheme is refused" in
+              broken_out and re.search(r"\d+ assertions, [1-9]\d* failed",
+                                       broken_out),
+              "a tool with one broken function turns the whole self-test red: "
+              "exit 1, and the summary names the assertion that failed")
+
+        # ---- the script run as a script, and imported as a module
+        import runpy
+        saved_argv = sys.argv
+        sys.argv = ["itemcensus.py"]
+        try:
+            ran_code = []
+            try:
+                captured(lambda: runpy.run_path(__file__, run_name="__main__"))
+            except SystemExit as exc:
+                ran_code.append(exc.code)
+            imported = runpy.run_path(__file__, run_name="itemcensus_imported")
+        finally:
+            sys.argv = saved_argv
+        check(ran_code == [64],
+              "run as a script, it exits with main()'s code: 64 for no --url")
+        check(callable(imported["main"]),
+              "imported as a module, it defines main() and runs nothing")
 
     print("-" * 68)
     total = passed[0] + len(failed)
