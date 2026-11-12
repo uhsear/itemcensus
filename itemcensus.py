@@ -641,6 +641,16 @@ def has_userinfo(url):
     return "@" in url
 
 
+def has_query_or_fragment(url):
+    """True when the url holds "?" or "#", where a token or password hides.
+
+    A portal root has neither. The url is printed, sent back in error text and
+    written into the inventory as typed, so a token in its query string would
+    reach a log and a file mailed around.
+    """
+    return "?" in url or "#" in url
+
+
 def redact(text, *secrets):
     """Remove secrets from anything about to be printed or written.
 
@@ -2438,6 +2448,43 @@ def self_test(_nested=False):
               and has_userinfo("https://host/portal") is False,
               "has_userinfo tells a url with user info from one without")
 
+        # ---- a token typed into the url never reaches a log or the file
+        leaky_urls = ("http://127.0.0.1:9/?token=LEAKTOKEN9",
+                      "county.maps.arcgis.com/sharing/rest?token=LEAKTOKEN9",
+                      "https://county.maps.arcgis.com/#token=LEAKTOKEN9",
+                      "https://county.maps.arcgis.com?password=LEAKTOKEN9")
+        for leaky in leaky_urls:
+            code, seen = captured(lambda: main(
+                ["--url", leaky, "--anonymous", "--query", "orgid:ORG1"]))
+            check(code == EXIT_USAGE and "LEAKTOKEN9" not in seen
+                  and "reading" not in seen,
+                  "a url with a query or fragment is refused without echoing "
+                  "it: %s  <-- pinned defect" % leaky.split("LEAKTOKEN9")[0])
+        check(has_query_or_fragment("https://host/portal") is False
+              and has_query_or_fragment("https://host/?token=x") is True
+              and has_query_or_fragment("https://host/#x") is True,
+              "has_query_or_fragment tells a bare portal address from one "
+              "with a query or fragment")
+        code, seen = captured(lambda: main(
+            ["--url", "county.maps.arcgis.com", "--anonymous"]))
+        check(code == EXIT_USAGE and "county.maps" not in seen
+              and "https://" in seen,
+              "the scheme refusal does not print the url back  "
+              "<-- pinned defect")
+
+        # ---- a token that sees nothing is not a census of an empty org
+        nothing_out = os.path.join(workdir, "nothing.csv")
+        blind_token = FakePortal(Catalog(rows(0)), users=["ann"])
+        code, seen = captured(lambda: serving(blind_token, lambda: main(
+            ["--url", PORTAL, "--token", "TESTTOKEN", "--out", nothing_out,
+             "--format", "csv", "--apply"])))
+        check(code == 2 and "found 0 items" in seen
+              and "Every partition reconciled" not in seen
+              and not os.path.exists(nothing_out),
+              "a token that finds no item exits 2 and writes no inventory, "
+              "because exit 0 would pass a blind token for an empty org  "
+              "<-- pinned defect")
+
         # a token from the environment, so it never has to be on argv
         env_portal = FakePortal(Catalog(rows(10)), users=["ann"])
         os.environ[TOKEN_ENV] = "ENVTOKEN"
@@ -2852,10 +2899,16 @@ def main(argv=None):
               "reach the log. Use --username and %s, or --token."
               % SECRET_ENV, file=sys.stderr)
         return EXIT_USAGE
+    if has_query_or_fragment(args.url):
+        print("error: --url must be the portal address alone, with no \"?\" "
+              "query string and no \"#\" fragment. Nothing is printed back, "
+              "because a token or password there would reach the log. Use "
+              "--token or %s." % TOKEN_ENV, file=sys.stderr)
+        return EXIT_USAGE
     if not is_http_url(args.url):
-        print("error: --url must start with https:// or http://, got %r. "
-              "urllib quotes a url it cannot open back into its own error, "
-              "and that url carries the token." % args.url, file=sys.stderr)
+        print("error: --url must start with https:// or http://. The url is "
+              "not printed back, because urllib quotes a url it cannot open "
+              "into its own error and a token may be in it.", file=sys.stderr)
         return EXIT_USAGE
     if args.apply and not args.out:
         print("error: --apply needs --out, the file to write the inventory to.",
@@ -2937,6 +2990,16 @@ def main(argv=None):
         # the portal, not from a bug here, so they are an exit code and a
         # message rather than a traceback.
         print("error: %s" % exc, file=sys.stderr)
+        return 2
+
+    if token is not None and result.total == 0:
+        # An empty org and a token that sees none of it look the same from here.
+        # Exit 0 would pass the second for the first.
+        print("")
+        print("error: the census found 0 items with a token. Either the "
+              "organization is empty or this token cannot see it (a wrong "
+              "--query, or an account with no access). The tool cannot tell "
+              "which, so no inventory is written.", file=sys.stderr)
         return 2
 
     print("")

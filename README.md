@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 450 lines, 446 of them assertions. Here are the first fourteen and the last
+A real run prints 457 lines, 453 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-446 assertions, 0 failed
+453 assertions, 0 failed
 ```
 
 ## Requirements
@@ -91,7 +91,7 @@ python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin \
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--url` | none | Portal url. Required. Must start with `https://` or `http://`. A url that holds an `@` is refused with exit 64, and is not printed back, because it may carry a password. |
+| `--url` | none | Portal url. Required. Must start with `https://` or `http://`. A url that holds an `@`, a `?` or a `#` is refused with exit 64, and no url is printed back, because the part after one of those may be a password or a token. The url is printed and written into the inventory as typed, so pass the token with `--token` or `ITEMCENSUS_TOKEN`. |
 | `--query` | the signed-in org | Search query to census. Everything else is ANDed onto it. |
 | `--token` | none | An existing portal token. Prefer the `ITEMCENSUS_TOKEN` environment variable: a value on `argv` is readable by every process on the machine. |
 | `--anonymous` | off | Census with no credential, on purpose. The search sees only public items. Required when there is no `--token`, `ITEMCENSUS_TOKEN` or `--username`, and refused together with any of them. With `--apply` it needs `--format json`, which records `"authenticated": false`. |
@@ -110,8 +110,8 @@ Exit codes:
 |---|---|
 | 0 | A complete census. |
 | 1 | The census did **not** reconcile, so its total is a floor. |
-| 2 | The census could not be completed. |
-| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. |
+| 2 | The census could not be completed. A token that finds 0 items also exits 2 and writes no inventory, because the tool cannot tell an empty organization from a token that sees none of it. |
+| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@`, `?` or `#` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. |
 | 73 | The census finished and was printed, but the inventory file could not be written. |
 
 The password is never a flag. `argv` is readable by every process on the machine, it lands in
@@ -339,7 +339,7 @@ one apostrophe in front of it. OWASP's CSV Injection page lists those leading ch
 lists the single quote prefix as one of several mitigations. Every text column is guarded: `id`,
 `title`, `owner`, `type` and `access`. The four number columns (`created`, `modified`, `size`,
 `numViews`) are never touched, so the `-1` the portal sends for an unknown size stays the number
-`-1`. JSON is not a spreadsheet format and is written as the portal sent it.
+`-1`. JSON is not a spreadsheet format, so it carries the same nine fields unguarded. It is not the portal's answer verbatim: it drops every other field (the item `url`, the description), casts the number fields to integers, and writes `private` for a missing `access`.
 
 The real `--format csv` output from the same stub, run with `--token` (`inv.csv`). The hostile title in the second row
 is the one written as `=HYPERLINK(...)` in the JSON above:
@@ -429,13 +429,13 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   redirected. An unattended job must export the variable. A run with no console at all (a
   process started with `DETACHED_PROCESS`, as a scheduler can) exits 2 and names the variable.
   That was run for real with a detached child process. The self-test asserts it only with a
-  stand-in for the console check, so it does not test the detached launch itself. Python's
-  `getpass` would loop for ever there, which is why the tool checks first.
+  stand-in for the console check, so it does not test the detached launch itself. The tool checks for a console
+  first, because the Windows prompt reads the console device and a process with none gets no answer. This
+  was observed, not taken from a documentation page.
 - The tool uses the proxy named in the environment, as urllib's default opener does, and
   follows HTTP redirects. No assertion covers either. A proxy that logs request urls sees the
-  token. The tool does not copy the token into a redirect on its own, and a 302 with no query
-  was tested by hand, but a `Location` that carries the same query string hands the token to
-  the target.
+  token. The tool does not copy the token into a redirect on its own, but a `Location` that
+  carries the same query string hands the token to the target.
 - An `--out` path the console cannot encode is written in full. The `wrote` line shows `?`
   for the characters it cannot print, and the exit code is the census code. The self-test
   asserts this against a console that raises on an unencodable character.
@@ -443,8 +443,10 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   because the search agreed with itself and you asked for it. Exit 0 there does not mean the
   whole organization was seen. The JSON file says so with `"authenticated": false`.
 - A token that can see nothing, such as a new non-administrator account or a mistyped `orgid`,
-  gives a census of zero items and exit 0. An empty result is a valid census, and the tool cannot
-  tell an empty organization from a token that sees none of it.
+  gives a census of zero items. The tool cannot tell that from an empty organization, so it
+  exits 2, prints why and writes no inventory. A truly empty organization is refused the same
+  way. The refusal applies only with a credential: an `--anonymous` census of zero items is
+  still printed, with its note.
 - A token sent to an `http://` url travels in clear text in the query string. Use `https://`.
 - A text cell that starts with a space and then a trigger character (` =1`) is not guarded.
   The CSV guard also assumes the text fields arrive as JSON strings, so a number sent as a
@@ -464,8 +466,12 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   endpoint expects it. Anything that logs request urls on the portal or on a proxy will see it.
 - `--url http://...` together with `--username` posts the password over cleartext HTTP. Only
   `--insecure` is refused with `--username`. Use an `https://` url when you sign in.
-- A `--url` that holds an `@` is refused before anything is printed. The test is the `@` alone,
-  so a portal url that really contains one cannot be used.
+- A `--url` that holds an `@`, a `?` or a `#` is refused before anything is printed, and the
+  refusal does not echo it. The test is the character alone, so a portal url that really
+  contains one cannot be used. A token in a `--url` is not tested by name: only these characters
+  are.
+- A numeric field that arrives as text `int()` cannot read, such as `"abc"` or the decimal
+  string `"12.0"`, ends the run with a traceback and exit 1, the same as the `"abc"` case above.
 - The `--query` and the progress lines are not passed through the console-encoding guard. A
   query with a character the console code page cannot encode, such as a Polish l-stroke on
   cp1252, exits 2 with an encoding error. Set `PYTHONIOENCODING=utf-8`.
@@ -501,16 +507,16 @@ Measured on 2026-11-11, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 446, 0 failed |
-| Windows | 3.12.10 | 446, 0 failed |
-| Windows | 3.10.20 | 446, 0 failed |
-| Windows | 3.9.25 | 446, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 446, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 446, 0 failed |
+| Windows | 3.13.2 | 453, 0 failed |
+| Windows | 3.12.10 | 453, 0 failed |
+| Windows | 3.10.20 | 453, 0 failed |
+| Windows | 3.9.25 | 453, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 453, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 453, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1390 statements, 236 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1410 statements, 242 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
