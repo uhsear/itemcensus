@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 438 lines, 434 of them assertions. Here are the first fourteen and the last
+A real run prints 450 lines, 446 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-434 assertions, 0 failed
+446 assertions, 0 failed
 ```
 
 ## Requirements
@@ -67,7 +67,9 @@ a 200 response carrying an ArcGIS error envelope, and the command line end to en
 stand-in portal that answers inside the process. One section also starts a stub portal on
 `127.0.0.1` with `http.server` and runs the command line against it over a real socket: a
 `generateToken` POST, search GETs, an HTTP 500 and a port nothing listens on. That section
-needs the loopback interface and nothing else.
+needs the loopback interface and nothing else. It sets `no_proxy` to `*` and points `HTTP_PROXY`
+and `HTTPS_PROXY` at a dead port for the length of the run, so a proxy in your environment
+cannot capture the loopback requests, and restores them afterwards.
 
 ## Quick start
 
@@ -76,7 +78,9 @@ python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin
 ```
 
 That counts the organization and prints the total and the partitions it needed. Nothing is
-written until you ask for a file.
+written until you ask for a file. A run with no credential at all is refused with exit 64
+unless you also pass `--anonymous`, because an anonymous census sees only public items and its
+total is not the organization's.
 
 ```
 python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin \
@@ -87,9 +91,10 @@ python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin \
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--url` | none | Portal url. Required. Must start with `https://` or `http://`. |
+| `--url` | none | Portal url. Required. Must start with `https://` or `http://`. A url that holds an `@` is refused with exit 64, and is not printed back, because it may carry a password. |
 | `--query` | the signed-in org | Search query to census. Everything else is ANDed onto it. |
 | `--token` | none | An existing portal token. Prefer the `ITEMCENSUS_TOKEN` environment variable: a value on `argv` is readable by every process on the machine. |
+| `--anonymous` | off | Census with no credential, on purpose. The search sees only public items. Required when there is no `--token`, `ITEMCENSUS_TOKEN` or `--username`, and refused together with any of them. With `--apply` it needs `--format json`, which records `"authenticated": false`. |
 | `--username` | none | Sign in as this user. The password comes from `ITEMCENSUS_PASSWORD` or an unechoed prompt. |
 | `--out` | none | File to write the inventory to. |
 | `--format` | `json` | `json` or `csv`. |
@@ -106,7 +111,7 @@ Exit codes:
 | 0 | A complete census. |
 | 1 | The census did **not** reconcile, so its total is a floor. |
 | 2 | The census could not be completed. |
-| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number and a bad `--format` all exit 64. |
+| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. |
 | 73 | The census finished and was printed, but the inventory file could not be written. |
 
 The password is never a flag. `argv` is readable by every process on the machine, it lands in
@@ -137,33 +142,39 @@ Read the whole organization with one query and you get the first 10,000 items an
 
 The bisect goes created date, then owner, then item type. This is a real run of the tool
 against a stub portal on `127.0.0.1` that holds 10,400 synthetic items and, like the real
-search, reports 10,000 for any query that matches more (`python itemcensus.py --url
+search, reports 10,000 for any query that matches more (`python itemcensus.py --anonymous --url
 http://127.0.0.1:18941 --query orgid:ORG`). The stub is not in the repository. The numbers in the
 date ranges depend on the clock when the run started:
 
 ```
 reading http://127.0.0.1:18941
 query: orgid:ORG
-  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[0 TO 1794407697075]
-  0 item(s) from (orgid:ORG) AND created:[0 TO 897203848537]
-  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[897203848538 TO 1794407697075]
-  0 item(s) from (orgid:ORG) AND created:[897203848538 TO 1345805772806]
-  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1345805772807 TO 1794407697075]
-  0 item(s) from (orgid:ORG) AND created:[1345805772807 TO 1570106734941]
-  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1570106734942 TO 1794407697075]
-  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1570106734942 TO 1682257216008]
-  8953 item(s) from (orgid:ORG) AND created:[1570106734942 TO 1626181975475]
-  1447 item(s) from (orgid:ORG) AND created:[1626181975476 TO 1682257216008]
-  0 item(s) from (orgid:ORG) AND created:[1682257216009 TO 1794407697075]
-  0 item(s) from (orgid:ORG) AND created:[1794407697076 TO 253402300799999]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[0 TO 1794449158396]
+  0 item(s) from (orgid:ORG) AND created:[0 TO 897224579198]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[897224579199 TO 1794449158396]
+  0 item(s) from (orgid:ORG) AND created:[897224579199 TO 1345836868797]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1345836868798 TO 1794449158396]
+  0 item(s) from (orgid:ORG) AND created:[1345836868798 TO 1570143013597]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1570143013598 TO 1794449158396]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1570143013598 TO 1682296085997]
+  at the 10000 ceiling, splitting: (orgid:ORG) AND created:[1570143013598 TO 1626219549797]
+  5652 item(s) from (orgid:ORG) AND created:[1570143013598 TO 1598181281697]
+  4748 item(s) from (orgid:ORG) AND created:[1598181281698 TO 1626219549797]
+  0 item(s) from (orgid:ORG) AND created:[1626219549798 TO 1682296085997]
+  0 item(s) from (orgid:ORG) AND created:[1682296085998 TO 1794449158396]
+  0 item(s) from (orgid:ORG) AND created:[1794449158397 TO 253402300799999]
 
-10400 item(s), read in 7 partition(s) over 610 page(s), 5 bisection(s)
+10400 item(s), read in 8 partition(s) over 711 page(s), 6 bisection(s)
 Every partition reconciled: the reported total matched the rows returned,
 on every page, and no partition sat on the 10000 ceiling.
+
+NOTE: no token was used, so only public items were visible. This total is not
+the organization's, and exit 0 does not mean every item was seen.
 ```
 
-The `0 item(s)` partitions are the date ranges before the stub's first item and after its last,
-and the final one is the tail from step 5. Every owner and item type split is exercised by the
+The two lines after the summary are what every `--anonymous` run prints. The `0 item(s)`
+partitions are the date ranges before the stub's first item and after its last, and the final
+one is the tail from step 5. Every owner and item type split is exercised by the
 self-test, not by this run: the stub is anonymous, so no owner list is read.
 
 Every split is a **complement pair**. Splitting owners into "these four" and "those four" is only
@@ -227,19 +238,24 @@ file records `"reconciled": false`.
 ## Output
 
 `--format json` writes the partition list next to the items, so the file carries its own proof.
-This is the real output of `python itemcensus.py --url http://127.0.0.1:18940 --query orgid:ORG
---out inv.json --apply` against a stub portal holding three synthetic items, one of them with a
+It also records `"authenticated"`: `false` for an `--anonymous` run, so a file that was mailed
+away from its console still says the census saw public items only.
+This is the real output of `python itemcensus.py --anonymous --url http://127.0.0.1:18940
+--query orgid:ORG --out inv.json --apply` against a stub portal holding three synthetic items, one of them with a
 hostile title:
 
 ```
 reading http://127.0.0.1:18940
 query: orgid:ORG
-  3 item(s) from (orgid:ORG) AND created:[0 TO 1794407695547]
-  0 item(s) from (orgid:ORG) AND created:[1794407695548 TO 253402300799999]
+  3 item(s) from (orgid:ORG) AND created:[0 TO 1794449197051]
+  0 item(s) from (orgid:ORG) AND created:[1794449197052 TO 253402300799999]
 
 3 item(s), read in 2 partition(s) over 2 page(s), 0 bisection(s)
 Every partition reconciled: the reported total matched the rows returned,
 on every page, and no partition sat on the 10000 ceiling.
+
+NOTE: no token was used, so only public items were visible. This total is not
+the organization's, and exit 0 does not mean every item was seen.
 
 wrote inv.json
 ```
@@ -248,6 +264,7 @@ and the file it wrote:
 
 ```json
 {
+ "authenticated": false,
  "bisections": 0,
  "itemcensus": 1,
  "items": [
@@ -288,26 +305,27 @@ and the file it wrote:
  "pages": 2,
  "partitions": [
   {
-   "query": "(orgid:ORG) AND created:[0 TO 1794407695547]",
+   "query": "(orgid:ORG) AND created:[0 TO 1794449197051]",
    "reported": 3,
    "returned": 3
   },
   {
-   "query": "(orgid:ORG) AND created:[1794407695548 TO 253402300799999]",
+   "query": "(orgid:ORG) AND created:[1794449197052 TO 253402300799999]",
    "reported": 0,
    "returned": 0
   }
  ],
  "query": "orgid:ORG",
  "reconciled": true,
- "taken": "2026-11-11T14:34:55Z",
+ "taken": "2026-11-12T02:06:37Z",
  "total": 3,
  "url": "http://127.0.0.1:18940",
  "warnings": []
 }
 ```
 
-`--format csv` writes those nine columns and nothing else. Items are sorted by id in both. The
+`--format csv` writes those nine columns and nothing else. It has no column for
+`authenticated`, so `--anonymous --apply --format csv` is refused with exit 64. Items are sorted by id in both. The
 CSV of two censuses of an unchanged organization is the same bytes, so `diff` is useful on it.
 The JSON is not: it carries `taken` and the clock reading inside each partition query, so two
 JSON files differ on those lines even when the items match.
@@ -323,7 +341,7 @@ lists the single quote prefix as one of several mitigations. Every text column i
 `numViews`) are never touched, so the `-1` the portal sends for an unknown size stays the number
 `-1`. JSON is not a spreadsheet format and is written as the portal sent it.
 
-The real `--format csv` output from the same stub (`inv.csv`). The hostile title in the second row
+The real `--format csv` output from the same stub, run with `--token` (`inv.csv`). The hostile title in the second row
 is the one written as `=HYPERLINK(...)` in the JSON above:
 
 ```
@@ -421,9 +439,12 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 - An `--out` path the console cannot encode is written in full. The `wrote` line shows `?`
   for the characters it cannot print, and the exit code is the census code. The self-test
   asserts this against a console that raises on an unencodable character.
-- An anonymous run (no token) prints a note that only public items were visible and still
-  exits 0, because the search agreed with itself. Exit 0 there does not mean the whole
-  organization was seen.
+- An `--anonymous` run prints a note that only public items were visible and still exits 0,
+  because the search agreed with itself and you asked for it. Exit 0 there does not mean the
+  whole organization was seen. The JSON file says so with `"authenticated": false`.
+- A token that can see nothing, such as a new non-administrator account or a mistyped `orgid`,
+  gives a census of zero items and exit 0. An empty result is a valid census, and the tool cannot
+  tell an empty organization from a token that sees none of it.
 - A token sent to an `http://` url travels in clear text in the query string. Use `https://`.
 - A text cell that starts with a space and then a trigger character (` =1`) is not guarded.
   The CSV guard also assumes the text fields arrive as JSON strings, so a number sent as a
@@ -443,15 +464,27 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   endpoint expects it. Anything that logs request urls on the portal or on a proxy will see it.
 - `--url http://...` together with `--username` posts the password over cleartext HTTP. Only
   `--insecure` is refused with `--username`. Use an `https://` url when you sign in.
-- Do not put credentials in `--url`. It is printed as `reading <url>` and saved as the `url`
-  field of the inventory exactly as given.
+- A `--url` that holds an `@` is refused before anything is printed. The test is the `@` alone,
+  so a portal url that really contains one cannot be used.
 - The `--query` and the progress lines are not passed through the console-encoding guard. A
   query with a character the console code page cannot encode, such as a Polish l-stroke on
   cp1252, exits 2 with an encoding error. Set `PYTHONIOENCODING=utf-8`.
 - The inventory is written by opening the file for writing, so it is truncated first. A crash or
   a full disk part-way through leaves a truncated file. Write to a new file name for each run.
-  A write that fails exits 73 with a message. A title or owner that is not encodable as UTF-8,
-  such as a lone surrogate, also exits 73, and the CSV can be left part-written.
+  A write that fails exits 73 with a message. In `--format csv`, a title or owner that is not
+  encodable as UTF-8, such as a lone surrogate, also exits 73, and the file can be left
+  part-written. The JSON writer escapes such a character and does not fail.
+- `--apply` replaces the file named by `--out` without asking.
+- Tokens are requested with `client=referer`, and later requests send no `Referer` header.
+  Whether a real portal accepts that was not tested.
+- The sentence that a real search result carries a service url, and on a secured service a token
+  in its query string, is a statement about the response shape. This README does not cite Esri
+  for it, and it was not checked against a real portal.
+- When a day sits on the ceiling and no owner list was read, the refusal says the day holds
+  one owner and one item type. The tool did not establish that, so read it as "no finer split
+  was available". The exit code 2 and the missing total are right.
+- The stub that produced the 10,400-item figures above is not in the repository, so a reader
+  cannot reproduce those partition and page counts exactly.
 - `--insecure` is covered only by a stand-in that records the flag, because the stub portal is
   plain `http://127.0.0.1`. The password prompt (`getpass`) is never run from a terminal.
 - The self-test binds a loopback `http.server` on `127.0.0.1`. It fails on a host that has no
@@ -468,16 +501,16 @@ Measured on 2026-11-11, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 434, 0 failed |
-| Windows | 3.12.10 | 434, 0 failed |
-| Windows | 3.10.20 | 434, 0 failed |
-| Windows | 3.9.25 | 434, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 434, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 434, 0 failed |
+| Windows | 3.13.2 | 446, 0 failed |
+| Windows | 3.12.10 | 446, 0 failed |
+| Windows | 3.10.20 | 446, 0 failed |
+| Windows | 3.9.25 | 446, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 446, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 446, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1342 statements, 222 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1390 statements, 236 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because

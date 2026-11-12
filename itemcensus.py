@@ -26,7 +26,7 @@ thing it writes is an inventory file, which needs --apply.
 
 Exit codes: 0 a complete census, 1 the census did NOT reconcile and its total
 is a floor, 2 the census could not be completed, 64 usage error (a mistyped or
-unknown flag included), 73 the census ran but the inventory file could not be
+unknown flag included, and a run with no credential and no --anonymous), 73 the census ran but the inventory file could not be
 written.
 """
 
@@ -554,11 +554,17 @@ def item_record(raw):
     }
 
 
-def build_inventory(url, query, taken, result):
-    """Assemble the inventory document. No credential ever enters it."""
+def build_inventory(url, query, taken, result, authenticated):
+    """Assemble the inventory document. No credential ever enters it.
+
+    authenticated is False for an --anonymous run. That search sees only public
+    items, so the file has to say so itself: "reconciled" is true for it, and a
+    file is mailed around without the console note that came with the run.
+    """
     return {
         "itemcensus": 1,
         "url": url,
+        "authenticated": bool(authenticated),
         "query": query,
         "taken": taken,
         "total": result.total,
@@ -623,6 +629,16 @@ def is_http_url(url):
     scheduler log.
     """
     return bool(url) and url.lower().startswith(("http://", "https://"))
+
+
+def has_userinfo(url):
+    """True when the url may carry a password (https://user:pass@host).
+
+    Any "@" counts. A password may itself hold "/", "?" or "#", so no parse of
+    the url can say where the user name ends, and the safe reading of an
+    ambiguous url is to refuse it before it is printed anywhere.
+    """
+    return "@" in url
 
 
 def redact(text, *secrets):
@@ -1527,7 +1543,7 @@ def self_test(_nested=False):
     # "reconciled": false, and an operator reading the exit code would have
     # trusted a total the tool had just disowned.
     check(drifted.reconciled is False
-          and build_inventory(PORTAL, "q", "t", drifted)["reconciled"] is False,
+          and build_inventory(PORTAL, "q", "t", drifted, True)["reconciled"] is False,
           "and exit 1 lines up with reconciled=false in the document, not with "
           "a census that reconciled  <-- pinned defect")
     check(describe(drifted)[0].startswith("%d item(s)" % drifted.total)
@@ -1619,7 +1635,7 @@ def self_test(_nested=False):
           "the portal's -1 for an unknown size is kept as it was reported")
 
     document = build_inventory(PORTAL, "orgid:ORG123", "2026-09-16T00:00:00Z",
-                               result)
+                               result, True)
     check(document["total"] == 250 and document["reconciled"] is True,
           "the inventory document carries the total and the verdict")
     check(document["url"] == PORTAL and document["query"] == "orgid:ORG123",
@@ -1633,7 +1649,7 @@ def self_test(_nested=False):
     check(list(scrambled.items) != sorted(scrambled.items),
           "the crawl really did read those ids backwards, or the next "
           "assertion would prove nothing  <-- pinned defect")
-    jumbled = build_inventory(PORTAL, "q", "t", scrambled)
+    jumbled = build_inventory(PORTAL, "q", "t", scrambled, True)
     check([it["id"] for it in jumbled["items"]]
           == sorted(it["id"] for it in jumbled["items"]),
           "items are written in id order even when the portal returned them "
@@ -1641,7 +1657,7 @@ def self_test(_nested=False):
           "<-- pinned defect")
     check(document["partitions"][0]["reported"] == 250,
           "the partitions are listed with what each one reported")
-    check(build_inventory(PORTAL, "q", "t", drifted)["warnings"],
+    check(build_inventory(PORTAL, "q", "t", drifted, True)["warnings"],
           "an unreconciled census carries its warnings into the document")
 
     # ---- rendering
@@ -1989,6 +2005,17 @@ def self_test(_nested=False):
     workdir = tempfile.mkdtemp(prefix="itemcensus-selftest-")
     # An ambient token would turn every anonymous run below into a signed-in one.
     ambient_token = os.environ.pop(TOKEN_ENV, "")
+    # The loopback stub below must not go through a proxy the machine sets for
+    # the internet. With HTTP_PROXY set, urllib sent these requests to the
+    # proxy and the run died on a missing file instead of a failed assertion.
+    # The run now sets a dead proxy itself, so the bypass is exercised on every
+    # machine, not only on one that has a proxy. Both spellings of no_proxy,
+    # because the lower-case one wins on Linux.
+    proxy_env = {"no_proxy": "*", "NO_PROXY": "*",
+                 "HTTP_PROXY": "http://127.0.0.1:9",
+                 "HTTPS_PROXY": "http://127.0.0.1:9"}
+    ambient_proxy = {n: os.environ[n] for n in proxy_env if n in os.environ}
+    os.environ.update(proxy_env)
     try:
         out_json = os.path.join(workdir, "inventory.json")
         out_csv = os.path.join(workdir, "nested", "inventory.csv")
@@ -2100,7 +2127,8 @@ def self_test(_nested=False):
 
         code, seen = captured(lambda: serving(
             FakePortal(Catalog(rows(250)), users=["ann"]),
-            lambda: main(["--url", PORTAL, "--query", "orgid:X"])))
+            lambda: main(["--url", PORTAL, "--query", "orgid:X",
+                          "--anonymous"])))
         check(code == 0 and "250 item(s)" in seen
               and "no token was used" in seen
               and "does not mean every item was seen" in seen
@@ -2227,7 +2255,8 @@ def self_test(_nested=False):
               "cannot split the row")
 
         hostile_doc = build_inventory(PORTAL, "q", "t", census(
-            Catalog(rows(3)), base="orgid:ORG123", now_ms=NOW, types=()))
+            Catalog(rows(3)), base="orgid:ORG123", now_ms=NOW, types=()),
+            True)
         hostile_doc["items"][0].update(title=leads[0][1], owner=leads[4][1])
         hostile_json = write_json(hostile_doc,
                                   os.path.join(workdir, "hostile.json"))
@@ -2334,7 +2363,7 @@ def self_test(_nested=False):
 
         public_only = FakePortal(Catalog(rows(10)), users=["ann"])
         code, seen = captured(lambda: serving(public_only, lambda: main(
-            ["--url", PORTAL])))
+            ["--url", PORTAL, "--anonymous"])))
         check(code == 0 and "10 item(s)" in seen,
               "an anonymous census of the public items needs no credential "
               "at all")
@@ -2343,6 +2372,71 @@ def self_test(_nested=False):
         check("owner(s) available" not in seen,
               "an anonymous run reads no user list, because the portal would "
               "refuse it, and the bisect falls back on item type")
+
+        # ---- an anonymous run has to be asked for, and says so in its file
+        bare = FakePortal(Catalog(rows(10)), users=["ann"])
+        code, seen = captured(lambda: serving(bare, lambda: main(
+            ["--url", PORTAL])))
+        check(code == EXIT_USAGE and bare.searches == 0
+              and "--anonymous" in seen and "10 item(s)" not in seen,
+              "no credential and no --anonymous exits 64 before any search, "
+              "because exit 0 would pass public items for the org  "
+              "<-- pinned defect")
+        for flags, what in ((["--token", "TESTTOKEN"], "--token"),
+                            (["--username", "gis_admin"], "--username")):
+            clash = FakePortal(Catalog(rows(10)), users=["ann"])
+            code, seen = captured(lambda: serving(clash, lambda: main(
+                ["--url", PORTAL, "--anonymous"] + flags)))
+            check(code == EXIT_USAGE and clash.searches == 0
+                  and "TESTTOKEN" not in seen,
+                  "--anonymous together with %s is refused" % what)
+        os.environ[TOKEN_ENV] = "ENVTOKEN"
+        try:
+            code, seen = captured(lambda: main(
+                ["--url", PORTAL, "--anonymous"]))
+        finally:
+            del os.environ[TOKEN_ENV]
+        check(code == EXIT_USAGE and "ENVTOKEN" not in seen,
+              "and so is --anonymous with a token in the environment")
+        anon_csv = os.path.join(workdir, "anon.csv")
+        code, seen = captured(lambda: main(
+            ["--url", PORTAL, "--anonymous", "--out", anon_csv, "--format",
+             "csv", "--apply"]))
+        check(code == EXIT_USAGE and not os.path.exists(anon_csv)
+              and "authenticated" in seen,
+              "an anonymous csv is refused, since it has no column to say "
+              "public items only  <-- pinned defect")
+        anon_json = os.path.join(workdir, "anon.json")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(10)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--anonymous", "--out", anon_json,
+                          "--apply"])))
+        with io.open(anon_json, "r", encoding="utf-8") as handle:
+            anon_doc = json.load(handle)
+        check(code == 0 and anon_doc["authenticated"] is False
+              and anon_doc["reconciled"] is True,
+              "an anonymous inventory file records authenticated false, "
+              "though it reconciled  <-- pinned defect")
+        check(written["authenticated"] is True
+              and build_inventory(PORTAL, "q", "t", result, False)[
+                  "authenticated"] is False,
+              "and a signed-in one records true")
+
+        # ---- a password typed into the url never reaches a log
+        bad_urls = ("http://ann:Sekret-Pass-99@127.0.0.1:1",
+                    "ann:Sekret-Pass-99@127.0.0.1:1",
+                    "http://ann:Sekret/Pass-99@127.0.0.1:1",
+                    "http://ann:Sekret?Pass#99@127.0.0.1:1")
+        for bad_url in bad_urls:
+            code, seen = captured(lambda: main(
+                ["--url", bad_url, "--token", "TESTTOKEN"]))
+            check(code == EXIT_USAGE and "Sekret" not in seen
+                  and "Pass-99" not in seen and "99@" not in seen,
+                  "a url with user info is refused without echoing it: %s"
+                  % bad_url.split("Sekret")[0] + "...  <-- pinned defect")
+        check(has_userinfo("https://u:p@host") is True
+              and has_userinfo("https://host/portal") is False,
+              "has_userinfo tells a url with user info from one without")
 
         # a token from the environment, so it never has to be on argv
         env_portal = FakePortal(Catalog(rows(10)), users=["ann"])
@@ -2534,6 +2628,9 @@ def self_test(_nested=False):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         os.environ.update({TOKEN_ENV: ambient_token} if ambient_token else {})
+        for name in proxy_env:
+            os.environ.pop(name, None)
+        os.environ.update(ambient_proxy)
 
     # ---- argument handling
     args = _parse(["--url", PORTAL])
@@ -2695,6 +2792,12 @@ def _parse(argv):
                     help="an existing portal token. Prefer %s: a value on "
                          "argv is readable by every process on the box and is "
                          "kept in shell history and audit logs." % TOKEN_ENV)
+    ap.add_argument("--anonymous", action="store_true",
+                    help="census without any credential. The search then sees "
+                         "only public items, so the total is not the "
+                         "organization's. Needed when no --token, %s or "
+                         "--username is given, and refused with one."
+                         % TOKEN_ENV)
     ap.add_argument("--username",
                     help="generate a token for this user. The password comes "
                          "from %s or an unechoed prompt, never from argv."
@@ -2743,6 +2846,12 @@ def main(argv=None):
         print("error: --url is required. Use --self-test to verify the tool "
               "without a portal.", file=sys.stderr)
         return EXIT_USAGE
+    if has_userinfo(args.url):
+        print("error: --url must not hold a user name or password (an \"@\" "
+              "was found). Nothing is printed back, because the password would "
+              "reach the log. Use --username and %s, or --token."
+              % SECRET_ENV, file=sys.stderr)
+        return EXIT_USAGE
     if not is_http_url(args.url):
         print("error: --url must start with https:// or http://, got %r. "
               "urllib quotes a url it cannot open back into its own error, "
@@ -2761,6 +2870,25 @@ def main(argv=None):
         return EXIT_USAGE
     if args.max_partitions < 1:
         print("error: --max-partitions must be at least 1.", file=sys.stderr)
+        return EXIT_USAGE
+    has_credential = bool(args.token or os.environ.get(TOKEN_ENV)
+                          or args.username)
+    if args.anonymous and has_credential:
+        print("error: --anonymous with a credential (--token, %s or "
+              "--username) says two things. Drop one." % TOKEN_ENV,
+              file=sys.stderr)
+        return EXIT_USAGE
+    if not args.anonymous and not has_credential:
+        print("error: no credential was given. An anonymous census sees only "
+              "public items and its total is not the organization's. Pass "
+              "--token, export %s, or pass --username. To count public items "
+              "on purpose, pass --anonymous." % TOKEN_ENV, file=sys.stderr)
+        return EXIT_USAGE
+    if args.anonymous and args.apply and args.format == "csv":
+        print("error: a csv has no column to say the run was anonymous, so it "
+              "would pass for a whole-organization inventory. Use --format "
+              "json, which records \"authenticated\": false.",
+              file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -2819,7 +2947,7 @@ def main(argv=None):
     if args.out:
         document = build_inventory(args.url, query,
                                    utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                   result)
+                                   result, token is not None)
         if not args.apply:
             print("")
             print("Check only. No inventory was written. Re-run with --apply.")
