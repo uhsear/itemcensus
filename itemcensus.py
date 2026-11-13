@@ -39,6 +39,7 @@ import getpass
 import io
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -117,6 +118,10 @@ EXIT_WRITE_FAILED = 73
 
 # Exit status for a usage error, from the hand-written checks and from argparse.
 EXIT_USAGE = 64
+
+# The role portals/self reports for an organization administrator, custom roles
+# with administrative privileges included.
+ADMIN_ROLE = "org_admin"
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -554,17 +559,19 @@ def item_record(raw):
     }
 
 
-def build_inventory(url, query, taken, result, authenticated):
+def build_inventory(url, query, taken, result, authenticated, role=None):
     """Assemble the inventory document. No credential ever enters it.
 
     authenticated is False for an --anonymous run. That search sees only public
     items, so the file has to say so itself: "reconciled" is true for it, and a
-    file is mailed around without the console note that came with the run.
+    file is mailed around without the console note that came with the run. role
+    is the signed-in account's role from portals/self, None when it was not read.
     """
     return {
         "itemcensus": 1,
         "url": url,
         "authenticated": bool(authenticated),
+        "role": role,
         "query": query,
         "taken": taken,
         "total": result.total,
@@ -582,11 +589,13 @@ def build_inventory(url, query, taken, result, authenticated):
     }
 
 
-def describe(result, anonymous=False):
+def describe(result, anonymous=False, role=ADMIN_ROLE):
     """Render a census as the lines the CLI prints.
 
     anonymous is True when no token was used. The search then sees only public
-    items, and "reconciled" would read as a statement about the whole org.
+    items, and "reconciled" would read as a statement about the whole org. role
+    is the signed-in account's role, None when the portal did not say. Only
+    org_admin is known to see every item, so any other role gets a note.
     """
     out = ["%d item(s), read in %d partition(s) over %d page(s), %d bisection(s)"
            % (result.total, len(result.partitions), result.pages,
@@ -612,6 +621,13 @@ def describe(result, anonymous=False):
                    "This total is not")
         out.append("the organization's, and exit 0 does not mean every item "
                    "was seen.")
+    elif role != ADMIN_ROLE:
+        out.append("")
+        out.append("NOTE: the signed-in account's role is %s, not %s, so items "
+                   "it cannot see are"
+                   % (role if role else "unreadable", ADMIN_ROLE))
+        out.append("missing from this total, and exit 0 does not mean every "
+                   "item was seen.")
     return out
 
 
@@ -810,11 +826,26 @@ def generate_token(url, username, secret, insecure=False):
     return token
 
 
-def org_id(url, token, insecure=False):
-    """The signed-in organization's id, or None when the portal will not say."""
+def portal_self(url, token, insecure=False):
+    """The portals/self reply: the org id, and with a token the signed-in user."""
     params = {"token": token} if token else {}
-    body = _call(url, "portals/self", params, insecure=insecure)
-    return body.get("id")
+    return _call(url, "portals/self", params, insecure=insecure)
+
+
+def account_role(me):
+    """The signed-in user's role from a portals/self reply, or None.
+
+    None means the reply named no role the tool can trust: no user object (a
+    token-less call), no role, or a role that is not a plain word. Esri lists
+    org_admin, org_publisher and org_user, and a custom role reports the one it
+    maps to.
+    """
+    user = me.get("user")
+    role = user.get("role") if isinstance(user, dict) else None
+    if (isinstance(role, str) and role.isascii()
+            and role.replace("_", "").isalnum()):
+        return role
+    return None
 
 
 def org_owners(url, token, insecure=False):
@@ -873,8 +904,8 @@ def cell(value):
     A title, owner or id comes from the portal, and anyone who can name an item
     can name it =HYPERLINK(...). An inventory is the kind of file somebody opens
     in a spreadsheet, though nothing here opened one. Text that starts with = + - @ tab or CR gets
-    one apostrophe in front. Numbers pass through untouched: size is -1 for an
-    unknown size, and that is a number, not a formula. Whoever reads this file
+    one apostrophe in front. Numbers pass through untouched: Esri returns size
+    as -1 in a search result, and that is a number, not a formula. Whoever reads this file
     back strips exactly one leading apostrophe from a cell whose next character
     is one of CSV_FORMULA_LEAD. This tool never reads its own CSV.
     """
@@ -1642,7 +1673,7 @@ def self_test(_nested=False):
     check(thin["access"] == "private",
           "an item with no access field is recorded private, the safe reading")
     check(item_record({"id": "a", "size": -1})["size"] == -1,
-          "the portal's -1 for an unknown size is kept as it was reported")
+          "a size of -1 is kept as the number the portal sent")
 
     document = build_inventory(PORTAL, "orgid:ORG123", "2026-09-16T00:00:00Z",
                                result, True)
@@ -1740,10 +1771,12 @@ def self_test(_nested=False):
         """A portal answering in process from a Catalog and a user list."""
 
         def __init__(self, catalog=None, users=(), org="ORG123",
-                     token="TESTTOKEN", open_error=None, fail_search_after=None):
+                     token="TESTTOKEN", open_error=None, fail_search_after=None,
+                     role="org_admin"):
             self.catalog = catalog
             self.users = list(users)
             self.org = org
+            self.role = role
             self.token = token
             self.open_error = open_error
             self.fail_search_after = fail_search_after
@@ -1775,7 +1808,10 @@ def self_test(_nested=False):
                                       "message": "Invalid username or password."}}
                 return {"token": self.token, "expires": 9999999999999}
             if path.endswith("/portals/self"):
-                return {"id": self.org} if self.org else {}
+                me = {"id": self.org} if self.org else {}
+                if self.role and params.get("token"):
+                    me["user"] = {"username": "ann", "role": self.role}
+                return me
             if path.endswith("/portals/self/users"):
                 start = int(params.get("start") or 1)
                 num = min(int(params.get("num") or 10), SEARCH_MAX_NUM)
@@ -1876,7 +1912,8 @@ def self_test(_nested=False):
         def _body(self, path, params):
             return ["maintenance", "in progress"]
 
-    shaped = fails(lambda: serving(NotAnObject(), lambda: org_id(PORTAL, None)),
+    shaped = fails(lambda: serving(NotAnObject(),
+                                   lambda: portal_self(PORTAL, None)),
                    "a portal answering with a JSON array is refused, not fed "
                    "to body.get() as a traceback  <-- pinned defect")
     check("not an" in shaped and "list" in shaped,
@@ -1889,12 +1926,14 @@ def self_test(_nested=False):
                                                   "created:[0 TO 1]")),
           "and the search crawl")
 
-    check(serving(portal, lambda: org_id(PORTAL, "TESTTOKEN")) == "ORG123",
+    check(serving(portal, lambda: portal_self(PORTAL, "TESTTOKEN"))["id"]
+          == "ORG123",
           "the org id is read from portals/self")
-    check(serving(FakePortal(org=None), lambda: org_id(PORTAL, None)) is None,
+    check(serving(FakePortal(org=None),
+                  lambda: portal_self(PORTAL, None)).get("id") is None,
           "a portal that will not name its org gives no id, not a wrong one")
     blind = FakePortal(org=None)
-    serving(blind, lambda: org_id(PORTAL, None))
+    serving(blind, lambda: portal_self(PORTAL, None))
     check(not any("token=" in t for t in blind.targets),
           "portals/self is asked anonymously when there is no token")
 
@@ -1956,7 +1995,8 @@ def self_test(_nested=False):
 
     leaky = FakePortal(open_error=lambda target: ValueError(
         "unknown url type: %r" % target))
-    quoted = fails(lambda: serving(leaky, lambda: org_id(PORTAL, "TESTTOKEN")),
+    quoted = fails(lambda: serving(
+        leaky, lambda: portal_self(PORTAL, "TESTTOKEN")),
                    "an exception out of urllib is raised as a portal error")
     check("TESTTOKEN" not in quoted,
           "the token in the url urllib quoted back is redacted out of the "
@@ -1977,7 +2017,7 @@ def self_test(_nested=False):
 
     encoded = fails(lambda: serving(
         FakePortal(open_error=lambda t: ValueError("bad url %r" % t)),
-        lambda: org_id(PORTAL, "AB+CD/=X")),
+        lambda: portal_self(PORTAL, "AB+CD/=X")),
         "a request urllib refuses to open is raised")
     check("AB%2B" not in encoded and "AB+CD" not in encoded
           and REDACTED in encoded,
@@ -1988,7 +2028,8 @@ def self_test(_nested=False):
         def _body(self, path, params):
             return {"error": "maintenance window"}
 
-    texty = fails(lambda: serving(StringError(), lambda: org_id(PORTAL, None)),
+    texty = fails(lambda: serving(StringError(),
+                                  lambda: portal_self(PORTAL, None)),
                   "a portal whose error is a bare string is raised, not an "
                   "AttributeError")
     check("maintenance window" in texty,
@@ -2003,7 +2044,7 @@ def self_test(_nested=False):
           "<-- pinned defect")
 
     insecure_portal = FakePortal(org="ORG123")
-    serving(insecure_portal, lambda: org_id(PORTAL, None, insecure=True))
+    serving(insecure_portal, lambda: portal_self(PORTAL, None, insecure=True))
     check(insecure_portal.insecure is True,
           "--insecure reaches the opener when it is asked for")
     check(isinstance(_opener(False), urllib.request.OpenerDirector),
@@ -2424,13 +2465,143 @@ def self_test(_nested=False):
         with io.open(anon_json, "r", encoding="utf-8") as handle:
             anon_doc = json.load(handle)
         check(code == 0 and anon_doc["authenticated"] is False
-              and anon_doc["reconciled"] is True,
+              and anon_doc["reconciled"] is True and anon_doc["role"] is None,
               "an anonymous inventory file records authenticated false, "
               "though it reconciled  <-- pinned defect")
         check(written["authenticated"] is True
               and build_inventory(PORTAL, "q", "t", result, False)[
                   "authenticated"] is False,
               "and a signed-in one records true")
+
+        # ---- a token that is not an administrator's sees part of the org
+        check(account_role({"user": {"role": "org_admin"}}) == "org_admin"
+              and account_role({"user": {"role": "org_user"}}) == "org_user",
+              "account_role reads the role out of portals/self")
+        check(account_role({}) is None
+              and account_role({"user": "ann"}) is None
+              and account_role({"user": {}}) is None
+              and account_role({"user": {"role": 7}}) is None
+              and account_role({"user": {"role": "org" + chr(27) + "[31m"}})
+              is None
+              and account_role({"user": {"role": "org_" + chr(0xe9)}}) is None,
+              "and gives None for a reply with no role, or a role that is not "
+              "a plain word, so a hostile portal cannot put escape codes on "
+              "the console  <-- pinned defect")
+        check("NOTE" not in " ".join(describe(result))
+              and "NOTE" not in " ".join(describe(result, role="org_admin")),
+              "an administrator's census carries no note")
+        limited = " ".join(describe(result, role="org_user"))
+        check("role is org_user" in limited and "not org_admin" in limited
+              and "does not mean every item was seen" in limited,
+              "a census by another role says what it could not see  "
+              "<-- pinned defect")
+        check("role is unreadable" in " ".join(describe(result, role=None)),
+              "and so does one whose role the portal did not say")
+        check("role is" not in " ".join(describe(result, anonymous=True,
+                                                 role=None)),
+              "an anonymous run gets the anonymous note and no role note")
+        check(build_inventory(PORTAL, "q", "t", result, True, "org_user")[
+            "role"] == "org_user"
+              and build_inventory(PORTAL, "q", "t", result, False)[
+                  "role"] is None,
+              "the inventory records the role, None when none was read")
+
+        for role, wording in (("org_user", "role is org_user"),
+                              (None, "role is unreadable")):
+            lone_json = os.path.join(workdir, "role-%s.json" % role)
+            lone = FakePortal(Catalog(rows(10)), users=["ann"], role=role)
+            code, seen = captured(lambda: serving(lone, lambda: main(
+                ["--url", PORTAL, "--token", "TESTTOKEN", "--query",
+                 "orgid:X", "--out", lone_json, "--apply"])))
+            with io.open(lone_json, "r", encoding="utf-8") as handle:
+                lone_doc = json.load(handle)
+            check(code == 0 and wording in seen
+                  and "Every partition reconciled" in seen
+                  and lone_doc["role"] == role,
+                  "a run whose role is %s says so on screen and in the file, "
+                  "with --query given  <-- pinned defect" % role)
+            check(any(t.split("?")[0].endswith("/portals/self")
+                      for t in lone.targets),
+                  "portals/self is read for the role even with --query")
+            lone_csv = os.path.join(workdir, "role-%s.csv" % role)
+            lone = FakePortal(Catalog(rows(10)), users=["ann"], role=role)
+            code, seen = captured(lambda: serving(lone, lambda: main(
+                ["--url", PORTAL, "--token", "TESTTOKEN", "--query",
+                 "orgid:X", "--out", lone_csv, "--format", "csv",
+                 "--apply"])))
+            check(code == EXIT_USAGE and not os.path.exists(lone_csv)
+                  and lone.searches == 0 and "TESTTOKEN" not in seen
+                  and "--format json" in seen,
+                  "a csv from a run whose role is %s is refused before any "
+                  "search  <-- pinned defect" % role)
+        admin_json = os.path.join(workdir, "role-admin.json")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(10)), users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", admin_json, "--apply"])))
+        with io.open(admin_json, "r", encoding="utf-8") as handle:
+            check(code == 0 and "NOTE" not in seen
+                  and json.load(handle)["role"] == "org_admin",
+                  "an administrator's inventory records org_admin and "
+                  "prints no note")
+        anon_json_role = FakePortal(Catalog(rows(10)), users=["ann"])
+        code, seen = captured(lambda: serving(anon_json_role, lambda: main(
+            ["--url", PORTAL, "--anonymous", "--query", "orgid:X"])))
+        check(not any(t.split("?")[0].endswith("/portals/self")
+                      for t in anon_json_role.targets),
+              "an anonymous run with --query still reads no portals/self")
+
+        # ---- a csv has no column for an unreconciled census either
+        drift_csv = os.path.join(workdir, "drift.csv")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(250), moving=[250, 251, 252]),
+                       users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", drift_csv, "--format", "csv",
+                          "--apply"])))
+        check(code == 1 and not os.path.exists(drift_csv)
+              and "RECONCILIATION WARNINGS" in seen
+              and "No csv was written" in seen,
+              "an unreconciled census writes no csv and still exits 1  "
+              "<-- pinned defect")
+        drift_json = os.path.join(workdir, "drift.json")
+        code, seen = captured(lambda: serving(
+            FakePortal(Catalog(rows(250), moving=[250, 251, 252]),
+                       users=["ann"]),
+            lambda: main(["--url", PORTAL, "--token", "TESTTOKEN",
+                          "--out", drift_json, "--apply"])))
+        with io.open(drift_json, "r", encoding="utf-8") as handle:
+            check(code == 1 and json.load(handle)["reconciled"] is False,
+                  "the same census as json is written, and records "
+                  "reconciled false")
+
+        # ---- a mistyped credential flag is not echoed back
+        for argv, shown in (
+                (["--url", PORTAL, "--username", "bob", "--password",
+                  "SECRETWORD1"], "--password"),
+                (["--url", PORTAL, "--password=SECRETWORD1"], "--password"),
+                (["--url", PORTAL, "--tokn", "SECRETWORD1"], "--tokn"),
+                (["--url", PORTAL, "--tok", "SECRETWORD1"], "--tok"),
+                (["--url", PORTAL, "--urll",
+                  "https://h.example?token=SECRETWORD1"], "--urll"),
+                (["--url", PORTAL, "SECRETWORD1"], "none"),
+                (["--url", PORTAL, "--Pass=SECRETWORD1"], "none"),
+                (["--url", PORTAL, "--" + "x" * 40 + "=SECRETWORD1"], "none")):
+            def run_argv(argv=argv):
+                try:
+                    return main(argv)
+                except SystemExit as exc:
+                    return exc.code
+            code, seen = captured(run_argv)
+            check(code == EXIT_USAGE and "SECRETWORD1" not in seen
+                  and "unrecognized arguments" in seen
+                  and "flags among them: %s" % shown in seen,
+                  "an unknown word in argv exits 64 and its value is not "
+                  "echoed: %s  <-- pinned defect" % shown)
+        code, seen = captured(lambda: main(["--url", PORTAL, "--anonymous",
+                                            "--apply"]))
+        check(code == EXIT_USAGE and "unrecognized" not in seen,
+              "known flags raise no unrecognized-argument error")
 
         # ---- a password typed into the url never reaches a log
         bad_urls = ("http://ann:Sekret-Pass-99@127.0.0.1:1",
@@ -2818,6 +2989,23 @@ class _Parser(argparse.ArgumentParser):
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
 
+    def parse_args(self, args=None, namespace=None):
+        """Refuse an unknown word without printing it.
+
+        argparse's own message quotes every unrecognized word. A mistyped
+        --password hunter2 or --tokn SECRET would put the secret on stderr, and
+        so in the scheduler log. Only a flag-shaped word is named; a value or a
+        bare word is counted.
+        """
+        known, extras = self.parse_known_args(args, namespace)
+        if extras:
+            flags = [word.split("=", 1)[0] for word in extras
+                     if re.match(r"--[a-z][a-z0-9-]{0,30}(=|$)", word)]
+            self.error("unrecognized arguments: %d word(s) not shown, because "
+                       "one may be a credential; flags among them: %s"
+                       % (len(extras), " ".join(flags) if flags else "none"))
+        return known
+
 
 def _parse(argv):
     ap = _Parser(
@@ -2946,9 +3134,21 @@ def main(argv=None):
 
     try:
         token = _authenticate(args)
+        me = {}
+        if token is not None or not args.query:
+            me = portal_self(args.url, token, args.insecure)
+        role = account_role(me) if token is not None else None
+        if (token is not None and role != ADMIN_ROLE and args.apply
+                and args.format == "csv"):
+            print("error: a csv has no column to say the signed-in account is "
+                  "not an organization administrator (its role is %s), so it "
+                  "would pass for a whole-organization inventory. Use --format "
+                  "json, which records the role."
+                  % (role if role else "unreadable"), file=sys.stderr)
+            return EXIT_USAGE
         query = args.query
         if not query:
-            oid = org_id(args.url, token, args.insecure)
+            oid = me.get("id")
             if not oid:
                 raise RuntimeError("could not read the org id, pass --query")
             query = "orgid:%s" % oid
@@ -3004,16 +3204,22 @@ def main(argv=None):
 
     print("")
     encoding = getattr(sys.stdout, "encoding", None)
-    for line in describe(result, anonymous=token is None):
+    for line in describe(result, anonymous=token is None, role=role):
         print(printable(line, encoding))
 
     if args.out:
         document = build_inventory(args.url, query,
                                    utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                   result, token is not None)
+                                   result, token is not None, role)
         if not args.apply:
             print("")
             print("Check only. No inventory was written. Re-run with --apply.")
+        elif args.format == "csv" and result.warnings:
+            print("")
+            print("error: the census did not reconcile, and a csv has no column "
+                  "to say so, so it would pass for a complete inventory. No csv "
+                  "was written. Run again, or use --format json, which records "
+                  "\"reconciled\": false.", file=sys.stderr)
         else:
             writer = write_csv if args.format == "csv" else write_json
             print("")

@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 457 lines, 453 of them assertions. Here are the first fourteen and the last
+A real run prints 483 lines, 479 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-453 assertions, 0 failed
+479 assertions, 0 failed
 ```
 
 ## Requirements
@@ -109,14 +109,17 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | A complete census. |
-| 1 | The census did **not** reconcile, so its total is a floor. |
+| 1 | The census did **not** reconcile, so its total is a floor. With `--format csv --apply` no csv is written for it. |
 | 2 | The census could not be completed. A token that finds 0 items also exits 2 and writes no inventory, because the tool cannot tell an empty organization from a token that sees none of it. |
-| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@`, `?` or `#` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. |
+| 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@`, `?` or `#` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. So does `--format csv --apply` when the signed-in role is not `org_admin`. |
 | 73 | The census finished and was printed, but the inventory file could not be written. |
 
 The password is never a flag. `argv` is readable by every process on the machine, it lands in
 shell history and in scheduler logs, and `--self-test` asserts that no `--password` attribute
-exists at all.
+exists at all. An unknown word on the command line, such as a mistyped `--password hunter2` or
+`--tokn VALUE`, exits 64. The message counts the unknown words and names only the ones shaped like
+a flag, cut at any `=`. It never prints a value, because argparse's own message would put a
+credential into the scheduler log.
 
 A token is different only in that `--token` exists. It has the same exposure as a password flag:
 the value is in the process list, in shell history and in process-creation audit logs. Export
@@ -232,8 +235,9 @@ and got an exception knows something; a caller that wanted a number and got 10,0
 
 A total that moves mid-crawl is different, and gets different treatment. Items really are created
 and deleted while a census runs, and that is not a reason to refuse. It is a reason to say so:
-the run exits 1, the warning names the first and last total the server gave, and the inventory
-file records `"reconciled": false`.
+the run exits 1, the warning names the first and last total the server gave, and a JSON inventory
+file records `"reconciled": false`. A csv has no such column, so `--format csv --apply` writes no
+file for that census and says so on stderr. The exit code stays 1.
 
 ## Output
 
@@ -317,6 +321,7 @@ and the file it wrote:
  ],
  "query": "orgid:ORG",
  "reconciled": true,
+ "role": null,
  "taken": "2026-11-12T02:06:37Z",
  "total": 3,
  "url": "http://127.0.0.1:18940",
@@ -325,7 +330,10 @@ and the file it wrote:
 ```
 
 `--format csv` writes those nine columns and nothing else. It has no column for
-`authenticated`, so `--anonymous --apply --format csv` is refused with exit 64. Items are sorted by id in both. The
+`authenticated`, so `--anonymous --apply --format csv` is refused with exit 64. For the same reason
+it is refused with exit 64 when the signed-in role is not `org_admin`, and it is not written for a
+census that did not reconcile. `role` is `null` in the sample above because that run was
+anonymous. Items are sorted by id in both. The
 CSV of two censuses of an unchanged organization is the same bytes, so `diff` is useful on it.
 The JSON is not: it carries `taken` and the clock reading inside each partition query, so two
 JSON files differ on those lines even when the items match.
@@ -338,8 +346,10 @@ lands in the file. An inventory is the kind of file somebody opens in a spreadsh
 one apostrophe in front of it. OWASP's CSV Injection page lists those leading characters and
 lists the single quote prefix as one of several mitigations. Every text column is guarded: `id`,
 `title`, `owner`, `type` and `access`. The four number columns (`created`, `modified`, `size`,
-`numViews`) are never touched, so the `-1` the portal sends for an unknown size stays the number
-`-1`. JSON is not a spreadsheet format, so it carries the same nine fields unguarded. It is not the portal's answer verbatim: it drops every other field (the item `url`, the description), casts the number fields to integers, and writes `private` for a missing `access`.
+`numViews`) are never touched, so a `size` of `-1` stays the number `-1`. The `size` values in
+the samples above come from the stub, which invents them. Esri's Search page says "size is always
+returned as -1" in a search result, so a real portal gives `-1` in every row of that column. It is
+a fixed value there, not a marker for an unknown size, and the tool cannot measure item size. JSON is not a spreadsheet format, so it carries the same nine fields unguarded. It is not the portal's answer verbatim: it drops every other field (the item `url`, the description), casts the number fields to integers, and writes `private` for a missing `access`.
 
 The real `--format csv` output from the same stub, run with `--token` (`inv.csv`). The hostile title in the second row
 is the one written as `=HYPERLINK(...)` in the JSON above:
@@ -367,12 +377,17 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 - No `total` you did not ask for. The number printed is the count of distinct item ids actually
   read, never a number the server reported.
 - No usage or cost figures. `size` and `numViews` are copied from the search result as they were
-  reported, including the `-1` the portal uses for an unknown size.
+  reported. Esri documents `size` as always `-1` in a search result, so that column carries no
+  information from a real portal.
 - No group membership. An item's groups need a call per group, which is `sharewatch`'s shape,
   not this one's.
 - It cannot see items it is not allowed to see. An anonymous census counts public items, and a
-  census run as a non-administrator is limited to what that user can search. This was not run
-  against a real portal. The number is honest about the query, not about the organization.
+  census run as a non-administrator is limited to what that user can search. The tool reads
+  `user.role` from `portals/self` whenever a token is present. When the role is not `org_admin`,
+  or the reply names none, the run prints a NOTE, exits 0, records `"role"` in the JSON file and
+  refuses `--format csv --apply` with exit 64. Esri says a custom role with administrative
+  privileges reports `org_admin`. This was run against a local stub only, never a real portal.
+  The number is honest about the query, not about the organization.
 - More than 10,000 items created by one user, of one type, in one day cannot be counted by this
   method, because the search API offers nothing narrower to split on. That is the case it
   refuses, and the refusal names the exact query it gave up on.
@@ -501,22 +516,41 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   behavior not listed here was not checked against a real portal: every network path ran
   against a local stub.
 
+- Owner names that hold a hyphen, a period or one of the words AND, OR, NOT and TO are not
+  quoted in the owner bisect, which relies on the search parser reading them as one term. That
+  was not checked against Esri's parser. It matters only when one owner has more than 10,000
+  items in one day.
+- When the `portals/self/users` reply has no `users` key, the owner list is empty and the owner
+  bisect is off without a note. That costs partitions, not items. A refused list prints a note.
+- A `--token` value that starts with `-`, which a URL-safe token can, is read by argparse as a
+  flag and exits 64. Pass `--token=VALUE` or use `ITEMCENSUS_TOKEN`.
+- Text from the portal, such as an error message or an owner name in the progress lines, is
+  printed as received, so a hostile portal can put control or escape characters on the console.
+  The role in the NOTE is the exception: it is printed only when it is a plain word.
+- The Esri pages cited here cover `search`, `search-reference`, `portals/self` and `user`. The
+  tool also relies on `generateToken`, on `portals/self/users` with `start` and `num`, and on
+  `client=referer`. Those are not cited, and none was run against a real portal.
+- OWASP's CSV Injection page now lists a tab prefix inside a quoted field as the mitigation that
+  resists Excel, and says the single quote prefix is unreliable after Excel saves the file
+  again. This tool uses the single quote prefix, which is the mitigation the self-test pins.
+
 ## Verification
 
-Measured on 2026-11-11, all against the same file.
+Measured on 2026-11-12, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 453, 0 failed |
-| Windows | 3.12.10 | 453, 0 failed |
-| Windows | 3.10.20 | 453, 0 failed |
-| Windows | 3.9.25 | 453, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 453, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 453, 0 failed |
+| Windows | 3.13.2 | 479, 0 failed |
+| Windows | 3.12.10 | 479, 0 failed |
+| Windows | 3.10.20 | 479, 0 failed |
+| Windows | 3.9.25 | 479, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 479, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 479, 0 failed |
+| Linux (Ubuntu) | 3.9.25, 3.10.21 and 3.11.16 | 479, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1410 statements, 242 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1485 statements, 260 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
@@ -534,6 +568,11 @@ summary goes red, and by running the file with `runpy` once as a script and once
 - Esri, [Search reference](https://developers.arcgis.com/rest/users-groups-and-items/search-reference/):
   `created: [start TO end]` in epoch milliseconds with inclusive brackets, `orgid:`, `owner:`,
   and the `-` prohibit operator that every complement split relies on.
+- Esri, [Portal Self](https://developers.arcgis.com/rest/users-groups-and-items/portal-self/):
+  the `user` object "is returned only when a token is passed in", and its `role` is `org_admin`,
+  `org_publisher` or `org_user`. Esri, [User](https://developers.arcgis.com/rest/users-groups-and-items/user/):
+  each role value also covers a custom role with the matching privileges, and `roleId` holds the
+  id of a custom one.
 - OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the leading
   characters, and the single quote prefix as one of several mitigations.
 - Esri, [ArcGIS API for Python, arcgis.gis](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.toc.html):
