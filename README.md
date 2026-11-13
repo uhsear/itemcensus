@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 487 lines, 483 of them assertions. Here are the first fourteen and the last
+A real run prints 492 lines, 488 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-483 assertions, 0 failed
+488 assertions, 0 failed
 ```
 
 ## Requirements
@@ -109,7 +109,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | A complete census. |
-| 1 | The total is a floor. Either the census did **not** reconcile, or the token's role is not `org_admin` (or the portal named none), so items it cannot see are missing. With `--format csv --apply` no csv is written for either. A role exit still writes the JSON file, which records `"role"`. An `--anonymous` run is the opted-in exception and exits 0. |
+| 1 | The total is a floor. Either the census did **not** reconcile, or the token's role is not `org_admin` (or the portal named none), so items it cannot see are missing. With `--format csv --apply` a run that reached the census writes no csv for either (a non-admin role is refused earlier, with exit 64). A role exit still writes the JSON file, which records `"role"`. An `--anonymous` run is the opted-in exception and exits 0. |
 | 2 | The census could not be completed. A token that finds 0 items also exits 2 and writes no inventory, because the tool cannot tell an empty organization from a token that sees none of it. |
 | 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@`, `?` or `#` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. So does `--format csv --apply` when the signed-in role is not `org_admin`. |
 | 73 | The census finished and was printed, but the inventory file could not be written. |
@@ -119,7 +119,8 @@ shell history and in scheduler logs, and `--self-test` asserts that no `--passwo
 exists at all. An unknown word on the command line, such as a mistyped `--password hunter2` or
 `--tokn VALUE`, exits 64. The message counts the unknown words and names only the ones shaped like
 a flag, cut at any `=`. It never prints a value, because argparse's own message would put a
-credential into the scheduler log.
+credential into the scheduler log. The exception is a value that argparse rejects for a typed flag
+such as `--num` or `--format`: argparse prints it back, as the Limits section says.
 
 A token is different only in that `--token` exists. It has the same exposure as a password flag:
 the value is in the process list, in shell history and in process-creation audit logs. Export
@@ -188,8 +189,16 @@ source does not have to be exhaustive. The date halves meet at one millisecond, 
 shared boundary, so no item lands in both.
 
 Results are unioned by item id rather than added up, so a partition that overlaps another one
-cannot inflate the total. That matters because an item edited during the crawl can be returned
-by both halves of a split it straddles.
+cannot inflate the total. That matters because an item that changes owner during the crawl can
+be returned by both halves of an owner split. A date split cannot do that, because `created` does
+not change.
+
+An item can also be lost, and the union cannot fix that. If an item moves to the owner of the
+first half after the first half was read, and before the second half is, it is in neither half,
+and both halves still reconcile. The census therefore reads the total of every first owner half
+again at the end of the run, one request each. If a total has changed, the run says so and exits
+1. A transfer in the other direction is counted twice by the union and also raises that warning.
+The self-test pins the loss with an item moved between the two reads.
 
 ## Why the obvious version is wrong
 
@@ -365,9 +374,10 @@ This tool never reads its own CSV back. Whatever does read it must strip exactly
 apostrophe from a cell whose next character is one of those six. The self-test pins that round
 trip for every text column and every leading character, tab and carriage return included.
 
-The service url is dropped on the way in. A real `search` response carries one, and on a secured
-service it carries a token in its query string, which would otherwise sit in an inventory file
-for years. `--self-test` asserts that no credential reaches stdout or the file.
+The service url is dropped on the way in, so no url is written to the file. If a search result
+carries one with a token in its query string, that token never reaches an inventory file that
+would sit on a share for years. Whether a real portal sends such a url was not checked, as the
+Limits section says. `--self-test` asserts that no credential reaches stdout or the file.
 
 ## What it will not do
 
@@ -441,6 +451,12 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   ran only against a synthetic query evaluator. Esri's search reference page shows `-` as an
   infix operator and the leading form was not run against a real portal. The same holds for
   `sortField=created` and the end-of-results `nextStart` of `-1`.
+- The end-of-run recheck of owner splits covers a first half that was read in full. A first half
+  that itself sat on the ceiling was split again and is not rechecked as a whole, so an item
+  moved into it after its pieces were read and before the second half was read is not caught.
+  Its inner owner halves are rechecked. The recheck compares a
+  total at two moments, so it cannot tell a transfer from a newly created item. Both are
+  reported as a change during the run.
 - A write failure after a census that did not reconcile exits 73, not 1. Read the printed
   warnings, not only the exit code.
 - With `--username` and no `ITEMCENSUS_PASSWORD` the tool prompts for the password. On Windows
@@ -555,16 +571,16 @@ Measured on 2026-11-12, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 483, 0 failed |
-| Windows | 3.12.10 | 483, 0 failed |
-| Windows | 3.10.20 | 483, 0 failed |
-| Windows | 3.9.25 | 483, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 483, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 483, 0 failed |
+| Windows | 3.13.2 | 488, 0 failed |
+| Windows | 3.12.10 | 488, 0 failed |
+| Windows | 3.10.20 | 488, 0 failed |
+| Windows | 3.9.25 | 488, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 488, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 488, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1490 statements, 262 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1516 statements, 270 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
@@ -581,8 +597,10 @@ earlier Linux runs on 3.9, 3.10 and 3.11 were not repeated for this count.
   is at the end. The tool ends the crawl on `-1`. When `nextStart` is missing it advances by the rows
   that came back and stops on a page with no rows. The self-test pins both.
 - Esri, [Search reference](https://developers.arcgis.com/rest/users-groups-and-items/search-reference/):
-  `created: [start TO end]` in epoch milliseconds with inclusive brackets, `orgid:`, `owner:`,
-  and the `-` prohibit operator that every complement split relies on.
+  `created: [start TO end]` in epoch milliseconds with inclusive brackets, `orgid:` and `owner:`.
+  The page shows the `-` prohibit operator only between terms (`California -Imagery`). The
+  leading form (`-owner:(...)`) that every complement split uses is not documented there, as the
+  Limits section says.
 - Esri, [Portal Self](https://developers.arcgis.com/rest/users-groups-and-items/portal-self/):
   the `user` object "is returned only when a token is passed in", and its `role` is `org_admin`,
   `org_publisher` or `org_user`. Esri, [User](https://developers.arcgis.com/rest/users-groups-and-items/user/):
@@ -591,8 +609,9 @@ earlier Linux runs on 3.9, 3.10 and 3.11 were not repeated for this count.
 - OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the leading
   characters, and the single quote prefix as one of several mitigations.
 - Esri, [ArcGIS API for Python, arcgis.gis](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.toc.html):
-  the `max_items`, `start` and `return_count` parameters of `ContentManager.search` and
-  `advanced_search`, read on 2026-11-11.
+  `ContentManager.search` takes `max_items` and has no `start` or `return_count`. Only
+  `advanced_search` takes `start`, `return_count` and a `max_items` of up to 10,000. Read on
+  2026-11-12.
 - Microsoft, [Consoles](https://learn.microsoft.com/en-us/windows/console/console-handles):
   `CONIN$` opens the console input buffer even when stdin is redirected. The page does not say
   what happens with no console. Opening it failed in a detached child process here, and that

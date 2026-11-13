@@ -260,7 +260,8 @@ class Partition(object):
     terminate rather than emitting the same clause for ever.
     """
 
-    def __init__(self, base, lo, hi, clauses=(), owners=(), types=()):
+    def __init__(self, base, lo, hi, clauses=(), owners=(), types=(),
+                 owner_half=False):
         lo, hi = int(lo), int(hi)
         if lo > hi:
             raise ValueError("partition range is backwards: %d > %d" % (lo, hi))
@@ -272,6 +273,10 @@ class Partition(object):
         self.clauses = tuple(clauses)
         self.owners = tuple(owners)
         self.types = tuple(types)
+        # True for the 'owner:(...)' half of an owner split. census() reads its
+        # total again at the end, because an item moved into that owner between
+        # the two halves is in neither half.
+        self.owner_half = owner_half
 
     @property
     def width_ms(self):
@@ -335,7 +340,8 @@ def _split_terms(part, field, terms):
     hit = Partition(part.base, part.lo, part.hi,
                     _narrow(part.clauses, field, field_clause(field, head)),
                     owners=inside if field == "owner" else part.owners,
-                    types=part.types if field == "owner" else inside)
+                    types=part.types if field == "owner" else inside,
+                    owner_half=field == "owner")
     miss = part.child(clause=field_clause(field, head, True),
                       owners=tail if field == "owner" else None,
                       types=None if field == "owner" else tail)
@@ -394,6 +400,26 @@ def reconcile(query, totals, collected):
     return out
 
 
+def search_answer(page):
+    """The (total, results) of one parsed search response, or ValueError."""
+    if not isinstance(page, dict):
+        raise ValueError("fetch returned a %s, which is not a search "
+                         "response" % type(page).__name__)
+    total = page.get("total")
+    results = page.get("results")
+    if (not isinstance(total, int) or isinstance(total, bool)
+            or not isinstance(results, list)):
+        # An empty object, a maintenance notice and a login page all parse
+        # as JSON. Read as a total of 0 they used to reconcile, and the
+        # census exited 0 having counted nothing. Keys only, as below.
+        raise ValueError("the portal's search answer is not a search "
+                         "response: it needs an integer total and a "
+                         "results list (it has the keys: %s)"
+                         % (", ".join(sorted("%s" % key for key in page))
+                            or "none"))
+    return total, results
+
+
 def crawl_partition(fetch, query, num=SEARCH_MAX_NUM):
     """Page one query to its end. Returns (items by id, totals seen, pages).
 
@@ -409,22 +435,8 @@ def crawl_partition(fetch, query, num=SEARCH_MAX_NUM):
     start = 1
     while start is not None:
         page = fetch(query, start, size)
-        if not isinstance(page, dict):
-            raise ValueError("fetch returned a %s, which is not a search "
-                             "response" % type(page).__name__)
+        total, results = search_answer(page)
         pages += 1
-        total = page.get("total")
-        results = page.get("results")
-        if (not isinstance(total, int) or isinstance(total, bool)
-                or not isinstance(results, list)):
-            # An empty object, a maintenance notice and a login page all parse
-            # as JSON. Read as a total of 0 they used to reconcile, and the
-            # census exited 0 having counted nothing. Keys only, as below.
-            raise ValueError("the portal's search answer is not a search "
-                             "response: it needs an integer total and a "
-                             "results list (it has the keys: %s)"
-                             % (", ".join(sorted("%s" % key for key in page))
-                                or "none"))
         totals.append(total)
         for raw in results:
             iid = raw.get("id")
@@ -493,6 +505,7 @@ def census(fetch, base="", owners=(), types=BISECT_TYPES, now_ms=None,
     bisections = 0
     pages = 0
     visited = 0
+    halves = []
 
     while pending:
         part = pending.pop()
@@ -526,9 +539,26 @@ def census(fetch, base="", owners=(), types=BISECT_TYPES, now_ms=None,
         if part.lo > now_ms:
             late += len(got)
         done.append((query, total, len(got)))
+        if part.owner_half:
+            halves.append((query, total))
         if echo:
             echo("  %d item(s) from %s" % (len(got), query))
 
+    # A date never changes, so a date split cannot lose an item. An owner can:
+    # an item moved to the owner of the first half after that half was read, and
+    # before the second half was, is in neither. Both halves still reconcile, so
+    # only a second look at the first half's total shows it. This reads the
+    # total only, one request per owner split, and is not counted in pages.
+    # ponytail: a first half that itself sat on the ceiling was split and is
+    # not rechecked at its own level, only its inner owner halves are.
+    for query, first in halves:
+        again = search_answer(fetch(query, 1, 1))[0]
+        if again != first:
+            warnings.append(
+                "%s reported %d item(s) when it was read and %d at the end "
+                "of the run, so an item changed owner or was created while "
+                "the census ran, and one moved between the two halves of an "
+                "owner split can be in neither" % (query, first, again))
     if late:
         warnings.append(
             "%d item(s) were created after this machine's clock read %d, "
@@ -1531,6 +1561,35 @@ def self_test(_nested=False):
     check(any("owner:(" in p[0] for p in crammed.partitions),
           "the census fell through to an owner clause to get there")
     check(crammed.reconciled is True, "and the owner split reconciles")
+
+    # An item moved to ann between the read of owner:(ann OR bob) and the read
+    # of -owner:(ann OR bob) is in neither half. Each half reconciles on its
+    # own, so the census used to count 10,399 and exit 0.
+    racing = Catalog([dict(r) for r in one_day])
+    moved = [r for r in racing.rows if r["owner"] == "cal"][0]
+    transfer = []
+
+    def transfer_fetch(query, start, num):
+        if "-owner:(" in query and not transfer:
+            moved["owner"] = "ann"
+            racing._cache.clear()
+            transfer.append(moved["id"])
+        return racing(query, start, num)
+
+    lost = census(transfer_fetch, base="orgid:ORG123", now_ms=NOW,
+                  owners=("ann", "bob", "cal", "dee"), types=())
+    check(transfer and moved["id"] not in lost.items,
+          "the repro really loses the transferred item  <-- pinned defect")
+    check(lost.reconciled is False and exit_code(lost) == 1,
+          "an owner transfer between the two halves of a split is not a clean "
+          "exit 0  <-- pinned defect")
+    check(any("changed owner" in w and "owner:(ann OR bob)" in w
+              for w in lost.warnings),
+          "and the warning names the first half that grew")
+    check(len(lost.warnings) == 1,
+          "one warning per changed half, none for the halves that held")
+    check(lost.pages == crammed.pages,
+          "the recheck reads totals only, so the page count does not move")
 
     stale = census(Catalog(one_day), base="orgid:ORG123", now_ms=NOW,
                    owners=("ann", "bob"), types=("Feature Service",))
