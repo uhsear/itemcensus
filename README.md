@@ -14,7 +14,7 @@ is that a true total of 10,000 and a truncated one are identical on the screen. 
 missing, nothing errors, nothing warns. You find out after the migration, when somebody goes
 looking for a layer that was never in the list.
 
-A real run prints 483 lines, 479 of them assertions. Here are the first fourteen and the last
+A real run prints 487 lines, 483 of them assertions. Here are the first fourteen and the last
 nine, copied unchanged from one run, with nothing elided inside either excerpt.
 
 ```
@@ -44,7 +44,7 @@ PASS  a tool with one broken function turns the whole self-test red: exit 1, and
 PASS  run as a script, it exits with main()'s code: 64 for no --url
 PASS  imported as a module, it defines main() and runs nothing
 --------------------------------------------------------------------
-479 assertions, 0 failed
+483 assertions, 0 failed
 ```
 
 ## Requirements
@@ -74,7 +74,7 @@ cannot capture the loopback requests, and restores them afterwards.
 ## Quick start
 
 ```
-python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin
+python itemcensus.py --url https://portal.example.com --username gis_admin
 ```
 
 That counts the organization and prints the total and the partitions it needed. Nothing is
@@ -83,7 +83,7 @@ unless you also pass `--anonymous`, because an anonymous census sees only public
 total is not the organization's.
 
 ```
-python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin \
+python itemcensus.py --url https://portal.example.com --username gis_admin \
     --out inventory.csv --format csv --apply
 ```
 
@@ -109,7 +109,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | A complete census. |
-| 1 | The census did **not** reconcile, so its total is a floor. With `--format csv --apply` no csv is written for it. |
+| 1 | The total is a floor. Either the census did **not** reconcile, or the token's role is not `org_admin` (or the portal named none), so items it cannot see are missing. With `--format csv --apply` no csv is written for either. A role exit still writes the JSON file, which records `"role"`. An `--anonymous` run is the opted-in exception and exits 0. |
 | 2 | The census could not be completed. A token that finds 0 items also exits 2 and writes no inventory, because the tool cannot tell an empty organization from a token that sees none of it. |
 | 64 | Usage error. A mistyped or unknown flag, a `--num` that is not a number, a bad `--format`, a `--url` with an `@`, `?` or `#` in it, no credential and no `--anonymous`, and `--anonymous` with a credential all exit 64. So does `--format csv --apply` when the signed-in role is not `org_admin`. |
 | 73 | The census finished and was printed, but the inventory file could not be written. |
@@ -371,8 +371,8 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 
 ## What it will not do
 
-- No item details, no data, no thumbnails. This counts and lists. Downloading is `itemvault`'s
-  job and it is a different problem.
+- No item details, no data, no thumbnails. This counts and lists. Restoring or snapshotting an item's
+  configuration, which `itemvault` is for, is a different problem.
 - No deletes, no re-shares, no transfers. There is no flag that changes the organization.
 - No `total` you did not ask for. The number printed is the count of distinct item ids actually
   read, never a number the server reported.
@@ -384,7 +384,7 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 - It cannot see items it is not allowed to see. An anonymous census counts public items, and a
   census run as a non-administrator is limited to what that user can search. The tool reads
   `user.role` from `portals/self` whenever a token is present. When the role is not `org_admin`,
-  or the reply names none, the run prints a NOTE, exits 0, records `"role"` in the JSON file and
+  or the reply names none, the run prints a NOTE, exits 1, records `"role"` in the JSON file and
   refuses `--format csv --apply` with exit 64. Esri says a custom role with administrative
   privileges reports `org_admin`. This was run against a local stub only, never a real portal.
   The number is honest about the query, not about the organization.
@@ -433,6 +433,10 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
 - An item created but not yet indexed by the portal's search is in neither the reported total
   nor the rows. Exit 0 means the search index agreed with itself, not that every item was
   indexed.
+- Exit 1 for a role other than `org_admin` is a verdict on the account, not on the search. The
+  JSON file from such a run still says `"reconciled": true`, because every partition agreed with
+  itself. Read `"role"` beside it. A scheduled job that wants only that user's view must expect
+  exit 1.
 - The leading-minus form (`-owner:(...)`, `-type:(...)`) that every complement split relies on
   ran only against a synthetic query evaluator. Esri's search reference page shows `-` as an
   infix operator and the leading form was not run against a real portal. The same holds for
@@ -510,12 +514,23 @@ for years. `--self-test` asserts that no credential reaches stdout or the file.
   plain `http://127.0.0.1`. The password prompt (`getpass`) is never run from a terminal.
 - The self-test binds a loopback `http.server` on `127.0.0.1`. It fails on a host that has no
   loopback interface or forbids local sockets.
-- The examples and the self-test fixtures use the placeholder url `https://county.maps.arcgis.com`
+- The examples and the self-test fixtures use the placeholder url `https://portal.example.com`
   and the user `gis_admin`. They are invented and name no real organization.
 - A portal error whose `error` value is a bare string is reported with that string. Portal
   behavior not listed here was not checked against a real portal: every network path ran
   against a local stub.
 
+- A value that argparse rejects for `--num` or `--format` is printed back in the usage error, so
+  never put a credential in those flags.
+- A token from `--token` or `ITEMCENSUS_TOKEN` wins over `--username`, and `--username` is then
+  ignored without a note.
+- Redaction replaces the secret wherever its text appears, so a very short test token garbles
+  the error message it is removed from.
+- An item with no `created` or `modified` value is recorded as `0`, which reads as a 1970 date,
+  and one with no `access` is recorded as private, both without a warning. Real search results
+  carry these fields.
+- A partition that sits on the ceiling is read through all 100 pages before it is split, so an
+  organization of 10,400 items costs about 700 requests. That is a cost, not a count error.
 - Owner names that hold a hyphen, a period or one of the words AND, OR, NOT and TO are not
   quoted in the owner bisect, which relies on the search parser reading them as one term. That
   was not checked against Esri's parser. It matters only when one owner has more than 10,000
@@ -540,21 +555,21 @@ Measured on 2026-11-12, all against the same file.
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 | 479, 0 failed |
-| Windows | 3.12.10 | 479, 0 failed |
-| Windows | 3.10.20 | 479, 0 failed |
-| Windows | 3.9.25 | 479, 0 failed |
-| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 479, 0 failed |
-| Linux (Ubuntu) | 3.12.3 | 479, 0 failed |
-| Linux (Ubuntu) | 3.9.25, 3.10.21 and 3.11.16 | 479, 0 failed |
+| Windows | 3.13.2 | 483, 0 failed |
+| Windows | 3.12.10 | 483, 0 failed |
+| Windows | 3.10.20 | 483, 0 failed |
+| Windows | 3.9.25 | 483, 0 failed |
+| Windows, ArcGIS Pro conda environments (two of them) | 3.11.8 and 3.13.7 | 483, 0 failed |
+| Linux (Ubuntu) | 3.12.3 | 483, 0 failed |
 
 The count is the same on every host, and the Linux output is byte for byte the Windows output
 once the carriage returns are stripped. Branch coverage of `itemcensus.py` is 100 percent
-(`coverage run --branch itemcensus.py --self-test`, 1485 statements, 260 branches). The last
+(`coverage run --branch itemcensus.py --self-test`, 1490 statements, 262 branches). The last
 branches are reached by running the whole self-test once with one function broken, to prove the
 summary goes red, and by running the file with `runpy` once as a script and once as a module.
 `pyflakes` is clean and `python -W error` compiles it. Coverage ran on Windows only, because
-`coverage` is not installed on the Linux host.
+`coverage` is not installed on the Linux host. The Linux host has only Python 3.12.3, so
+earlier Linux runs on 3.9, 3.10 and 3.11 were not repeated for this count.
 
 ## References
 
@@ -602,6 +617,6 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [sharewatch](https://github.com/uhsear/sharewatch) - once you can enumerate the org, diff its sharing posture against yesterday
-- [sightline](https://github.com/uhsear/sightline) - what a viewer can actually see among the items you just counted
+- [sightline](https://github.com/uhsear/sightline) - audit web maps for layers that the people viewing them cannot see
 - [whobreaks](https://github.com/uhsear/whobreaks) - what references an item before you delete it
 - [ghostsvc](https://github.com/uhsear/ghostsvc) - services the portal does not know it publishes

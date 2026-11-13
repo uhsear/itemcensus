@@ -20,12 +20,12 @@ It is read-only. No flag changes anything in the organization, and the only
 thing it writes is an inventory file, which needs --apply.
 
     python itemcensus.py --self-test
-    python itemcensus.py --url https://county.maps.arcgis.com --username gis_admin
-    python itemcensus.py --url https://county.maps.arcgis.com --token TOKEN \
+    python itemcensus.py --url https://portal.example.com --username gis_admin
+    python itemcensus.py --url https://portal.example.com --token TOKEN \
         --out inventory.csv --format csv --apply
 
-Exit codes: 0 a complete census, 1 the census did NOT reconcile and its total
-is a floor, 2 the census could not be completed, 64 usage error (a mistyped or
+Exit codes: 0 a complete census, 1 the census did NOT reconcile, or the token's
+role is not org_admin, so its total is a floor, 2 the census could not be completed, 64 usage error (a mistyped or
 unknown flag included, and a run with no credential and no --anonymous), 73 the census ran but the inventory file could not be
 written.
 """
@@ -626,14 +626,22 @@ def describe(result, anonymous=False, role=ADMIN_ROLE):
         out.append("NOTE: the signed-in account's role is %s, not %s, so items "
                    "it cannot see are"
                    % (role if role else "unreadable", ADMIN_ROLE))
-        out.append("missing from this total, and exit 0 does not mean every "
-                   "item was seen.")
+        out.append("missing from this total. The run exits 1, because the "
+                   "total is a floor.")
     return out
 
 
-def exit_code(result):
-    """0 for a census that reconciled, 1 for one that did not."""
-    return 1 if result.warnings else 0
+def exit_code(result, anonymous=False, role=ADMIN_ROLE):
+    """0 for a census that reconciled, 1 for one whose total is a floor.
+
+    A token whose role is not org_admin, or is unreadable, sees only part of
+    the org, so its total is a floor even when every partition reconciled. An
+    anonymous run asked for public items by passing --anonymous, so it is not
+    held to the role.
+    """
+    if result.warnings:
+        return 1
+    return 1 if not anonymous and role != ADMIN_ROLE else 0
 
 
 def is_http_url(url):
@@ -1015,7 +1023,7 @@ def self_test(_nested=False):
     DAY = DAY_MS
     BASE = 1577836800000                  # 2020-01-01T00:00:00Z, epoch ms
     NOW = BASE + 800 * DAY
-    PORTAL = "https://county.maps.arcgis.com"
+    PORTAL = "https://portal.example.com"
 
     # ---- the page size the server will honour
     check(clamp_num(100) == 100, "a page size of 100 is passed through")
@@ -1085,7 +1093,7 @@ def self_test(_nested=False):
     check(quote_term("jsmith") == "jsmith", "a plain username needs no quotes")
     check(quote_term("Feature Service") == '"Feature Service"',
           "a term with a space is quoted")
-    check(quote_term("county\\jsmith") == "county\\jsmith",
+    check(quote_term("corp\\jsmith") == "corp\\jsmith",
           "a windows-style domain login is left alone")
     check(quote_term("a:b") == '"a:b"',
           "a term holding a colon is quoted, or the server reads it as a field")
@@ -1579,6 +1587,16 @@ def self_test(_nested=False):
           "the warning names the first and the last total the server gave")
     check(exit_code(drifted) == 1, "an unreconciled census exits 1")
     check(exit_code(result) == 0, "a reconciled census exits 0")
+    check(exit_code(result, role="org_admin") == 0
+          and exit_code(result, role="org_user") == 1
+          and exit_code(result, role=None) == 1
+          and exit_code(drifted, role="org_admin") == 1,
+          "a census by a role other than org_admin exits 1, an unreadable "
+          "role too  <-- pinned defect")
+    check(exit_code(result, anonymous=True, role=None) == 0
+          and exit_code(drifted, anonymous=True, role=None) == 1,
+          "an anonymous run is not held to the role, but still exits 1 on "
+          "drift")
     # Exit 1 means the census did NOT reconcile. The docstring once read
     # "reconciled with warnings", which says the opposite of the document's own
     # "reconciled": false, and an operator reading the exit code would have
@@ -1732,7 +1750,7 @@ def self_test(_nested=False):
           "an https url is openable")
     check(is_http_url("http://portal.local/portal") is True,
           "a plain http url is openable")
-    check(is_http_url("county.maps.arcgis.com") is False,
+    check(is_http_url("portal.example.com") is False,
           "a url with no scheme is refused, because urllib quotes the whole "
           "url back into its error and that url carries the token  "
           "<-- pinned defect")
@@ -2492,7 +2510,7 @@ def self_test(_nested=False):
               "an administrator's census carries no note")
         limited = " ".join(describe(result, role="org_user"))
         check("role is org_user" in limited and "not org_admin" in limited
-              and "does not mean every item was seen" in limited,
+              and "exits 1" in limited,
               "a census by another role says what it could not see  "
               "<-- pinned defect")
         check("role is unreadable" in " ".join(describe(result, role=None)),
@@ -2515,11 +2533,14 @@ def self_test(_nested=False):
                  "orgid:X", "--out", lone_json, "--apply"])))
             with io.open(lone_json, "r", encoding="utf-8") as handle:
                 lone_doc = json.load(handle)
-            check(code == 0 and wording in seen
+            check(code == 1 and wording in seen
                   and "Every partition reconciled" in seen
                   and lone_doc["role"] == role,
                   "a run whose role is %s says so on screen and in the file, "
                   "with --query given  <-- pinned defect" % role)
+            check(code == 1 and os.path.exists(lone_json),
+                  "and exits 1 rather than 0, since its total is a floor, "
+                  "though the file is written  <-- pinned defect")
             check(any(t.split("?")[0].endswith("/portals/self")
                       for t in lone.targets),
                   "portals/self is read for the role even with --query")
@@ -2621,9 +2642,9 @@ def self_test(_nested=False):
 
         # ---- a token typed into the url never reaches a log or the file
         leaky_urls = ("http://127.0.0.1:9/?token=LEAKTOKEN9",
-                      "county.maps.arcgis.com/sharing/rest?token=LEAKTOKEN9",
-                      "https://county.maps.arcgis.com/#token=LEAKTOKEN9",
-                      "https://county.maps.arcgis.com?password=LEAKTOKEN9")
+                      "portal.example.com/sharing/rest?token=LEAKTOKEN9",
+                      "https://portal.example.com/#token=LEAKTOKEN9",
+                      "https://portal.example.com?password=LEAKTOKEN9")
         for leaky in leaky_urls:
             code, seen = captured(lambda: main(
                 ["--url", leaky, "--anonymous", "--query", "orgid:ORG1"]))
@@ -2637,8 +2658,8 @@ def self_test(_nested=False):
               "has_query_or_fragment tells a bare portal address from one "
               "with a query or fragment")
         code, seen = captured(lambda: main(
-            ["--url", "county.maps.arcgis.com", "--anonymous"]))
-        check(code == EXIT_USAGE and "county.maps" not in seen
+            ["--url", "portal.example.com", "--anonymous"]))
+        check(code == EXIT_USAGE and "portal.example" not in seen
               and "https://" in seen,
               "the scheme refusal does not print the url back  "
               "<-- pinned defect")
@@ -2724,7 +2745,7 @@ def self_test(_nested=False):
         code, seen = captured(lambda: main([]))
         check(code == 64 and "--url is required" in seen,
               "no --url at all is a usage error")
-        code, seen = captured(lambda: main(["--url", "county.maps.arcgis.com"]))
+        code, seen = captured(lambda: main(["--url", "portal.example.com"]))
         check(code == 64 and "https://" in seen,
               "a scheme-less --url is refused before any request is built  "
               "<-- pinned defect")
@@ -3019,7 +3040,7 @@ def _parse(argv):
         allow_abbrev=False,
     )
     ap.add_argument("--url",
-                    help="portal url, e.g. https://county.maps.arcgis.com")
+                    help="portal url, e.g. https://portal.example.com")
     ap.add_argument("--query",
                     help="search query to census (default: orgid of the "
                          "signed-in org)")
@@ -3239,7 +3260,7 @@ def main(argv=None):
             # turn a finished write into "could not write" and exit 73.
             print(printable("wrote %s" % written, encoding))
 
-    return exit_code(result)
+    return exit_code(result, anonymous=token is None, role=role)
 
 
 if __name__ == "__main__":
